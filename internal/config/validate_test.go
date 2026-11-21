@@ -9,7 +9,10 @@ import (
 // validDynamoConfig is a minimal, otherwise-fault-free dynamo-backend config
 // (no services), built as a struct literal per the brief rather than
 // round-tripped through YAML — Validate is the unit under test here, not
-// Load/decode.
+// Load/decode. The Docker, Updates and Disk blocks carry the values
+// defaults() (config.go) would have filled in, because Validate now rejects a
+// non-positive docker.timeout: a struct literal that skipped Load must still
+// look like a config that went through it.
 func validDynamoConfig() Config {
 	return Config{
 		Host: "host-a",
@@ -27,6 +30,9 @@ func validDynamoConfig() Config {
 			DemoteAfter:  3,
 			PromoteAfter: 6,
 		},
+		Docker:  DockerConfig{Socket: "/var/run/docker.sock", TimeoutSeconds: 30},
+		Updates: UpdatesConfig{Interval: "24h", TimeoutSeconds: 5},
+		Disk:    DiskConfig{MinFreeGB: 10},
 	}
 }
 
@@ -47,6 +53,9 @@ func validCloudflareConfig() Config {
 			DemoteAfter:  3,
 			PromoteAfter: 6,
 		},
+		Docker:  DockerConfig{Socket: "/var/run/docker.sock", TimeoutSeconds: 30},
+		Updates: UpdatesConfig{Interval: "24h", TimeoutSeconds: 5},
+		Disk:    DiskConfig{MinFreeGB: 10},
 	}
 }
 

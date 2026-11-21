@@ -48,6 +48,31 @@ const dynamoRenewChunkSize = 20
 // exactly the burst this 80% ceiling, not 100%, is headroom for.
 const dynamoCapacityBudget = 20
 
+// finitePositive reports whether v is a usable magnitude for a seconds knob:
+// neither NaN nor ±Inf, and strictly greater than zero. gopkg.in/yaml.v3
+// parses `.nan` and `.inf`, and every comparison against NaN is false — so a
+// bare `< 0` or `<= 0` check lets `interval: .nan` through, and
+// sleepInterval's `for remaining > 0` then never runs, spinning RunOnce in a
+// tight loop that spends the account-wide request meter. Zero is refused too
+// wherever it has no meaning: a zero http.Client.Timeout means NO timeout,
+// which is exactly the missing outbound deadline R2 promises never to have.
+func finitePositive(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0) && v > 0
+}
+
+// finite reports whether v is a real number: not NaN, not ±Inf. It is the
+// weaker rule for a knob where zero carries a meaning — disk.min_free_gb: 0
+// disables the free-space guard — but a non-finite value would still silently
+// subvert the comparison the knob feeds (a NaN floor is never exceeded, an
+// Inf one is never met).
+func finite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
+
+// finiteNonNegative reports whether v is a real number that is not negative.
+// It is for the per-service knobs whose zero value means "unset" — a
+// struct-literal Config never went through Load's defaults — so zero must
+// stay legal while NaN, ±Inf and a negative value must not.
+func finiteNonNegative(v float64) bool { return finite(v) && v >= 0 }
+
 // Validate collects every semantic fault in cfg (spec §6/§11). It never
 // stops at the first problem: an operator fixing a config one fault at a
 // time and re-running validate would otherwise chase faults one at a time
@@ -62,10 +87,30 @@ func Validate(c Config) []string {
 		faults = append(faults, fmt.Sprintf(
 			"arbiter.on_loss: %q is neither freeze nor stop, or arbiter-loss behavior is undefined", c.Arbiter.OnLoss))
 	}
-	if c.Timing.Interval <= 0 {
+	if !finitePositive(c.Timing.Interval) {
 		faults = append(faults, fmt.Sprintf(
-			"timing.interval: %g must be positive, or RunOnce spins in a tight loop burning the free-tier meters",
+			"timing.interval: %g must be a finite, positive number of seconds, or NaN/Inf (which every comparison misses) or 0 makes RunOnce spin in a tight loop burning the free-tier meters",
 			c.Timing.Interval))
+	}
+	if !finitePositive(c.Timing.TTL) {
+		faults = append(faults, fmt.Sprintf(
+			"timing.ttl: %g must be a finite, positive number of seconds, or the lease has no deadline an arbiter can grant",
+			c.Timing.TTL))
+	}
+	if !finitePositive(c.Arbiter.TimeoutSeconds) {
+		faults = append(faults, fmt.Sprintf(
+			"arbiter.timeout: %g must be a finite, positive number of seconds, or an http.Client with timeout 0 has NO deadline and a hung arbiter call blocks the loop indefinitely (R2)",
+			c.Arbiter.TimeoutSeconds))
+	}
+	if !finitePositive(c.Docker.TimeoutSeconds) {
+		faults = append(faults, fmt.Sprintf(
+			"docker.timeout: %g must be a finite, positive number of seconds, or an unresponsive daemon is never given up on",
+			c.Docker.TimeoutSeconds))
+	}
+	if !finite(c.Disk.MinFreeGB) {
+		faults = append(faults, fmt.Sprintf(
+			"disk.min_free_gb: %g must be a finite number, or a non-finite free-space floor silently disables the guard (0 is allowed, and disables it explicitly)",
+			c.Disk.MinFreeGB))
 	}
 	if c.Timing.DemoteAfter < 1 {
 		faults = append(faults, fmt.Sprintf(
@@ -95,6 +140,13 @@ func Validate(c Config) []string {
 			faults = append(faults, fmt.Sprintf(
 				"updates.interval: %q is negative — a negative interval ticks instantly and is never what an operator means; use 0 to disable the version check",
 				c.Updates.Interval))
+		case d > 0 && !finitePositive(c.Updates.TimeoutSeconds):
+			// Checked only while the check is actually enabled: a disabled
+			// check (interval 0) never reads its timeout, so a stale 0 there
+			// is not a fault.
+			faults = append(faults, fmt.Sprintf(
+				"updates.timeout: %g must be a finite, positive number of seconds while the version check is enabled, or the fetch is bounded by no deadline",
+				c.Updates.TimeoutSeconds))
 		}
 	}
 
@@ -181,12 +233,21 @@ func Validate(c Config) []string {
 		if strings.TrimSpace(s.Name) == "" {
 			faults = append(faults, fmt.Sprintf(
 				"services[%d].name: must be set, or the service has no identity to lease", i))
+		} else if f := dockerNameFault(fmt.Sprintf("services[%d].name", i), s.Name); f != "" {
+			faults = append(faults, f)
 		}
 		if strings.TrimSpace(s.Container) == "" {
 			faults = append(faults, fmt.Sprintf(
 				"services[%d].container: must be set, or Inspect(\"\") errors and the service container can never be started or stopped", i))
 		} else if f := containerPrefixFault(fmt.Sprintf("services[%d].container", i), s.Container); f != "" {
 			faults = append(faults, f)
+		} else if name := strings.TrimSuffix(s.Container, "*"); name != "" {
+			// The literal text before a trailing "*" is what the daemon-side
+			// prefix lookup matches; an exact name is itself. Both reach an
+			// Engine API path, so both obey Docker's name grammar.
+			if f := dockerNameFault(fmt.Sprintf("services[%d].container", i), name); f != "" {
+				faults = append(faults, f)
+			}
 		}
 		if strings.TrimSpace(s.Connector.Container) == "" {
 			faults = append(faults, fmt.Sprintf(
@@ -202,6 +263,21 @@ func Validate(c Config) []string {
 			faults = append(faults, fmt.Sprintf(
 				"services[%d].connector.container: %q must not contain *, or prefix matching is not supported for connector containers (they are stable-named Kamal accessories)",
 				i, s.Connector.Container))
+		} else if f := dockerNameFault(fmt.Sprintf("services[%d].connector.container", i), s.Connector.Container); f != "" {
+			faults = append(faults, f)
+		}
+		// Zero means "unset" for a struct-literal Config that bypassed Load's
+		// defaults (a real config always carries 35 / 2), so only NaN, ±Inf
+		// and a negative value are faults here.
+		if !finiteNonNegative(s.Connector.StopTimeout) {
+			faults = append(faults, fmt.Sprintf(
+				"services[%d].connector.stop_timeout: %g must be a finite, non-negative number of seconds, or the connector's stop deadline is nonsensical",
+				i, s.Connector.StopTimeout))
+		}
+		if !finiteNonNegative(s.Health.TimeoutSeconds) {
+			faults = append(faults, fmt.Sprintf(
+				"services[%d].health.timeout: %g must be a finite, non-negative number of seconds, or the probe is bounded by a nonsensical deadline",
+				i, s.Health.TimeoutSeconds))
 		}
 
 		// Both accessory lists: exact names, one owner per container. The
@@ -318,6 +394,10 @@ func (r accessoryRules) faults(field, kind, kinds string, names []string) []stri
 			faults = append(faults, fmt.Sprintf(
 				"%s: %q must not contain *, or prefix matching is not supported for %s (they are stable-named containers)",
 				at, a, kinds))
+			continue
+		}
+		if f := dockerNameFault(at, a); f != "" {
+			faults = append(faults, f)
 			continue
 		}
 		if seen[a] {
@@ -473,9 +553,39 @@ func dynamoCapacityWarnings(c Config) []string {
 		wcuPerSec, rcuPerSec)}
 }
 
+// dockerNamePattern is Docker's own container-name grammar: a name begins with
+// an alphanumeric and continues with alphanumerics, underscore, dot or dash.
+// Every config-derived name that is spliced into an Engine API path must match
+// it. Without this check a name containing "/", "?", "#" or a space can
+// reshape the request path or inject a query string — e.g. onto a stop call's
+// "?t=" — because dockerapi builds "/containers/"+name+"/stop?t=N". The
+// path builders escape the name too (dockerapi.containerPath); this half is
+// the config-time refusal, so the operator learns in CI rather than at 3am.
+var dockerNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
+
+// dockerNameFault reports a fault if name is not a legal Docker container
+// name. It is applied to every config-named container, and to the service and
+// hook names that are concatenated into a hook container's name
+// ("conch-hook-<service>-<hook>"), so neither the Engine API path builders nor
+// that concatenation ever receive a name that can reshape a request.
+func dockerNameFault(field, name string) string {
+	if dockerNamePattern.MatchString(name) {
+		return ""
+	}
+	return fmt.Sprintf(
+		"%s: %q is not a valid container name (Docker's grammar is [a-zA-Z0-9][a-zA-Z0-9_.-]*), or it can reshape the Docker API path it is spliced into",
+		field, name)
+}
+
 func validateHooks(serviceIndex int, phase string, hooks []HookSpec) []string {
 	var faults []string
 	for j, h := range hooks {
+		// The hook's name is concatenated into its container's name, so it
+		// obeys the same grammar as every other name that reaches the daemon.
+		if f := dockerNameFault(
+			fmt.Sprintf("services[%d].hooks.%s[%d].name", serviceIndex, phase, j), h.Name); f != "" {
+			faults = append(faults, f)
+		}
 		if strings.TrimSpace(h.Image) == "" {
 			faults = append(faults, fmt.Sprintf(
 				"services[%d].hooks.%s[%d]: image must be set, or the hook has nothing to run",
@@ -490,7 +600,13 @@ func validateHooks(serviceIndex int, phase string, hooks []HookSpec) []string {
 		// fills in Timeout == 0, on purpose) — a negative value only gets
 		// here from the operator's own YAML, so it's reported rather than
 		// silently folded into the same 300s default a bare omission gets.
-		if h.Timeout < 0 {
+		// A non-finite value is reported for the same reason: NaN/±Inf are
+		// only ever an explicit `.nan`/`.inf`, never a default.
+		if math.IsNaN(h.Timeout) || math.IsInf(h.Timeout, 0) {
+			faults = append(faults, fmt.Sprintf(
+				"services[%d].hooks.%s[%d].timeout: %g must be a finite number of seconds, or the hook's wait deadline is undefined",
+				serviceIndex, phase, j, h.Timeout))
+		} else if h.Timeout < 0 {
 			faults = append(faults, fmt.Sprintf(
 				"services[%d].hooks.%s[%d].timeout: %g must not be negative, or the hook's wait deadline is nonsensical",
 				serviceIndex, phase, j, h.Timeout))

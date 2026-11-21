@@ -370,6 +370,45 @@ func TestPositiveIntervalStillValid(t *testing.T) {
 	}
 }
 
+// TestNonFiniteAndZeroTimingValuesAreFaults: YAML parses `.nan` and `.inf`,
+// and every comparison against NaN is false, so a bare `<`/`<=` check lets
+// them straight through — `interval: .nan` makes sleepInterval's
+// `for remaining > 0` never run and RunOnce spin in a tight loop, and
+// `timeout: 0` removes the outbound deadline R2 promises. Validate refuses
+// all of them.
+func TestNonFiniteAndZeroTimingValuesAreFaults(t *testing.T) {
+	cases := []struct{ name, doc, field string }{
+		{"interval nan", minimal + "\ntiming: {interval: .nan}\n", "timing.interval"},
+		{"interval inf", minimal + "\ntiming: {interval: .inf}\n", "timing.interval"},
+		{"ttl nan", minimal + "\ntiming: {ttl: .nan}\n", "timing.ttl"},
+		{"arbiter timeout zero", strings.Replace(minimal,
+			"arbiter: {url:", "arbiter: {timeout: 0, url:", 1), "arbiter.timeout"},
+		{"arbiter timeout inf", strings.Replace(minimal,
+			"arbiter: {url:", "arbiter: {timeout: .inf, url:", 1), "arbiter.timeout"},
+		{"docker timeout zero", minimal + "\ndocker: {timeout: 0}\n", "docker.timeout"},
+		{"updates timeout zero", minimal + "\nupdates: {interval: 24h, timeout: 0}\n", "updates.timeout"},
+		{"disk min_free_gb nan", minimal + "\ndisk: {min_free_gb: .nan}\n", "disk.min_free_gb"},
+		{"connector stop_timeout nan", strings.Replace(minimal,
+			"connector: {container: cloudflared-web}",
+			"connector: {container: cloudflared-web, stop_timeout: .nan}", 1), "connector.stop_timeout"},
+		{"health timeout nan", strings.Replace(minimal,
+			`health: {url: "http://web-web:8080/up"}`,
+			`health: {url: "http://web-web:8080/up", timeout: .nan}`, 1), "health.timeout"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, faults, err := load(t, tc.doc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			joined := strings.Join(faults, "\n")
+			if !strings.Contains(joined, tc.field) {
+				t.Fatalf("want a fault at %s, got %v", tc.field, faults)
+			}
+		})
+	}
+}
+
 func TestDemoteAfterBelowOneIsAFault(t *testing.T) {
 	for _, demoteAfter := range []string{"0", "-2"} {
 		doc := minimal + "\ntiming: {demote_after: " + demoteAfter + "}\n"
@@ -566,6 +605,54 @@ func TestConnectorContainerWithAsteriskIsAFault(t *testing.T) {
 				t.Fatalf("want a connector.container * fault, got %v", faults)
 			}
 		})
+	}
+}
+
+// TestNamesThatReshapeTheDockerPathAreFaults: every config-named container,
+// and the service and hook names concatenated into a hook container's name,
+// reaches a Docker API path. Anything outside Docker's name grammar — a "/",
+// a "?", a space — must be refused before it can reshape that path or inject
+// a query string.
+func TestNamesThatReshapeTheDockerPathAreFaults(t *testing.T) {
+	cases := []struct{ name, doc, field string }{
+		{"service name", strings.Replace(minimal, "name: web", "name: web/../x", 1), "services[0].name"},
+		{"service container", strings.Replace(minimal, "container: web-web", `container: "web/../x"`, 1), "services[0].container"},
+		{"service container prefix", strings.Replace(minimal, "container: web-web", `container: "web?x=1*"`, 1), "services[0].container"},
+		{"connector container", strings.Replace(minimal,
+			"connector: {container: cloudflared-web}",
+			`connector: {container: "cloud?x=1"}`, 1), "services[0].connector.container"},
+		{"accessory", strings.Replace(minimal, "container: web-web",
+			"container: web-web\n    accessories: [\"a b\"]", 1), "services[0].accessories[0]"},
+		{"warm accessory", strings.Replace(minimal, "container: web-web",
+			"container: web-web\n    warm_accessories: [\"a/b\"]", 1), "services[0].warm_accessories[0]"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, faults, err := load(t, tc.doc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !anyFaultContains(faults, tc.field) {
+				t.Fatalf("want a fault at %s, got %v", tc.field, faults)
+			}
+		})
+	}
+}
+
+func TestHookNameThatReshapesTheDockerPathIsAFault(t *testing.T) {
+	doc := minimal + `
+    hooks:
+      promote:
+        - name: "a/b"
+          image: alpine
+          argv: ["restore"]
+`
+	_, faults, err := load(t, doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !anyFaultContains(faults, "hooks.promote[0].name") {
+		t.Fatalf("want a hook-name fault, got %v", faults)
 	}
 }
 
