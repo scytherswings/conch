@@ -51,7 +51,13 @@ Or install the CLI directly:
 go install github.com/scytherswings/conch/cmd/conch@latest
 ```
 
-Or build the container image:
+Or pull the published multi-arch image:
+
+```sh
+docker pull ghcr.io/scytherswings/conch:latest
+```
+
+Or build your own:
 
 ```sh
 docker build -t <your-registry>/conch:latest .

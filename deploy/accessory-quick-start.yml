@@ -87,7 +87,7 @@ accessories:
     service: conch                    # exact container name — `docker exec conch conch status`
                                        # and `kamal accessory exec --reuse conch ...` (spec §10)
                                        # both assume this name.
-    image: your-registry/conch:latest # build from Dockerfile and push under your own tag
+    image: ghcr.io/scytherswings/conch:latest # published multi-arch image; or build your own
     host: host-a                      # pin, don't use `hosts:` — see the header comment
     network: host
 

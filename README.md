@@ -85,9 +85,11 @@ Before booting for real, run the binary with `--dry-run` on a host. It logs ever
 decision, performs no actions, and sends the arbiter only reads. See
 [`docs/quickstart.md`](docs/quickstart.md) for the manual path and the dry run.
 
-If you are not using Kamal, build with `go build -o conch ./cmd/conch` or
+Prebuilt multi-arch images are published as `ghcr.io/scytherswings/conch` (pin a
+tag or digest in production). If you are not using Kamal, build with
+`go build -o conch ./cmd/conch` or
 `go install github.com/scytherswings/conch/cmd/conch@latest`, and run it with the
-same config. The Dockerfile builds a scratch image.
+same config.
 
 ## What conch is not
 

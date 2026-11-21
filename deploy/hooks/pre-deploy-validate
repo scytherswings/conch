@@ -29,7 +29,7 @@ CONFIG_FILE="conch.yml"
 # The conch image this deploy will actually run. Required, not defaulted —
 # a hardcoded placeholder here would validate against the wrong image (or
 # silently pull `latest` from wherever that resolves) without telling you.
-: "${CONCH_IMAGE:?set CONCH_IMAGE to the conch image:tag this deploy will run, e.g. your-registry/conch:latest}"
+: "${CONCH_IMAGE:?set CONCH_IMAGE to the conch image:tag this deploy will run, e.g. ghcr.io/scytherswings/conch:latest}"
 
 if [ ! -f "$CONFIG_DIR/$CONFIG_FILE" ]; then
   echo "pre-deploy-validate: $CONFIG_DIR/$CONFIG_FILE not found (run this from your Kamal project root)" >&2

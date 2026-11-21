@@ -39,7 +39,7 @@ accessories:
     # name, give each a distinct name instead (`conch-a`, `conch-b`) and
     # update deploy/README.md's `docker exec conch ...` examples to match.
     service: conch
-    image: your-registry/conch:latest
+    image: ghcr.io/scytherswings/conch:latest
     host: host-a
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -59,7 +59,7 @@ accessories:
 
   conch-host-b:
     service: conch
-    image: your-registry/conch:latest
+    image: ghcr.io/scytherswings/conch:latest
     host: host-b
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock

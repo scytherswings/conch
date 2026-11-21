@@ -55,7 +55,15 @@ host, use `docker exec conch conch status` (the binary is at `/conch` in the
 image) or mount a host directory at `/run/conch` and point the host-side CLI at
 it. Do not publish the admin socket on a network.
 
-## Build the image
+## Get the image
+
+Pull the published multi-arch image:
+
+```sh
+docker pull ghcr.io/scytherswings/conch:latest
+```
+
+Or build your own:
 
 ```sh
 docker build -t <your-registry>/conch:latest .

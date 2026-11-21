@@ -29,7 +29,8 @@ straight to Path 2, below — it needs no changes to how your app is deployed at
 
 Steps:
 
-1. Build and push the conch image: `docker build -t <your-registry>/conch:latest .` — see
+1. Use the published image (`ghcr.io/scytherswings/conch:latest`) or build your
+   own: `docker build -t <your-registry>/conch:latest .` — see
    [`Dockerfile`](../Dockerfile). It's a scratch image; nothing but the
    binary and CA certs.
 2. Copy [`config.example.host-a.yml`](./config.example.host-a.yml) to your Kamal project as
