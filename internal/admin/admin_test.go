@@ -288,6 +288,21 @@ func TestServeReplacesAStaleSocket(t *testing.T) {
 	}
 }
 
+// TestServeRefusesAWorldWritableSocketDirectory: the socket is chmodded 0600
+// only after bind, so a directory another local user can write to is a window
+// in which they can race conch to the socket path. Serve must refuse to serve
+// on one rather than open the window.
+func TestServeRefusesAWorldWritableSocketDirectory(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	err := Serve(context.Background(), filepath.Join(dir, "s.sock"), newStub())
+	if err == nil || !strings.Contains(err.Error(), "writable") {
+		t.Fatalf("a group/other-writable socket directory must be refused, got %v", err)
+	}
+}
+
 func TestServeStopsWithItsContextAndTakesTheSocketWithIt(t *testing.T) {
 	b := newStub()
 	socket := tempSocket(t)

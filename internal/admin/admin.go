@@ -66,6 +66,32 @@ type Backend interface {
 
 var _ Backend = (*supervisor.Supervisor)(nil)
 
+// secureDir creates the socket's parent directory (0700) when it is missing,
+// then refuses to serve if that directory is group- or other-writable. The
+// socket is bound inside it and chmodded 0600 only AFTER bind, so a directory
+// another local user can write to is a window in which they can race conch to
+// the socket path or replace it before the chmod — and a chmod cannot undo a
+// squatted path. Refusing a writable parent closes that window by
+// construction: bind(2) cannot be raced in a directory no one else can write
+// into. A sticky directory such as /tmp is other-writable and is refused for
+// the same reason.
+func secureDir(socketPath string) error {
+	dir := filepath.Dir(socketPath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("admin: creating the directory for %s: %w", socketPath, err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("admin: checking the directory for %s: %w", socketPath, err)
+	}
+	if info.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf(
+			"admin: socket directory %s is group- or other-writable (mode %04o); put the socket in a directory only its owner can write, or another local user can replace the socket before conch secures it",
+			dir, info.Mode().Perm())
+	}
+	return nil
+}
+
 // Serve runs the admin surface on socketPath until ctx is cancelled, and takes
 // the socket file with it when it goes.
 //
@@ -74,14 +100,16 @@ var _ Backend = (*supervisor.Supervisor)(nil)
 // doesn't exist fails with ENOENT — which, unhandled, would mean conch dies
 // at startup on every fresh container, before it ever reaches the arbiter or
 // the Docker socket. 0700 because anyone who can write into this directory
-// can plant something on the socket path before conch gets there.
+// can plant something on the socket path before conch gets there; an
+// already-existing directory that IS group- or other-writable is refused
+// rather than served on (secureDir, above).
 //
 // A stale socket left by a conch that was killed rather than stopped is
 // unlinked next: bind(2) fails on a path that already exists, so without this
 // a hard kill would cost the next conch its entire admin surface.
 func Serve(ctx context.Context, socketPath string, b Backend) error {
-	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
-		return fmt.Errorf("admin: creating the directory for %s: %w", socketPath, err)
+	if err := secureDir(socketPath); err != nil {
+		return err
 	}
 	if err := os.Remove(socketPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("admin: removing the stale socket %s: %w", socketPath, err)
