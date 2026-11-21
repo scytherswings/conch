@@ -127,6 +127,13 @@ healthy connector can still mean both hosts serve.
 - [Development](docs/development.md)
 - [Examples](examples/README.md)
 
+## For agents
+
+The fleet inventory is readable by any agent that holds the arbiter URL and the
+secret: `GET /fleet` (read-only), or `conch fleet --arbiter <url>`. An
+[Agent Skill](skills/conch-fleet/SKILL.md) teaches it in one step, with a
+bundled `curl` script.
+
 ## Development
 
 ```sh
