@@ -33,7 +33,7 @@ services:
       - web
 
   conch:
-    image: ${CONCH_IMAGE:-ghcr.io/scytherswings/conch-supervisor:latest}
+    image: ${CONCH_IMAGE:-ghcr.io/scytherswings/conch:latest}
     container_name: conch
     restart: unless-stopped
     command: ["run", "--config", "/etc/conch/conch.yml"]
