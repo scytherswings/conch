@@ -30,7 +30,7 @@ jobs:
         run: |
           unformatted="$(gofmt -l .)"
           if [ -n "$unformatted" ]; then
-            echo "gofmt needs ::" 1>&2
+            echo "gofmt needs to be run:" 1>&2
             printf '%s\n' "$unformatted" 1>&2
             exit 1
           fi

@@ -2,9 +2,9 @@
 
 Read this before you trust conch with anything you cannot lose.
 
-Conch is not high availability. It narrows the window in which two hosts both
-serve; it does not close it. The remaining gap is the cost of not using a paid
-load balancer.
+conch is **medium availability, best-effort**. It is not high availability. It
+narrows the window in which two hosts both serve; it does not close it. Whether
+that is good enough depends on your application.
 
 ## 1. A dead or stuck conch with a healthy connector means both hosts serve
 
