@@ -106,7 +106,7 @@ The full list is in [CONTRIBUTING.md](../CONTRIBUTING.md). The short version:
   supervisor paths; use the `Clock` interface.
 - **Every outbound call has a hard deadline.** A hung supervisor is a missing
   timeout on the arbiter client or the Docker socket client.
-- **`--dry-run` stays honest.** It logs every decision, executes none, and sends
+- **`--dry-run` does not perform actions.** It logs every decision, executes none, and sends
   the arbiter only `read` operations. A test enforces that.
 - **Services are configuration, not code.** A code path keyed on a particular
   application's name is going the wrong way.

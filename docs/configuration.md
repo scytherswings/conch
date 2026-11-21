@@ -280,8 +280,8 @@ connector:
 | `ready_url` | — | Optional readiness URL for the connector. The connector must be ready before the service is considered promoted. |
 
 The connector must be `restart: unless-stopped`, never `always`. `always`
-resurrects a connector conch deliberately stopped, which is the forbidden
-two-connectors outcome delivered by one YAML line.
+resurrects a connector conch deliberately stopped, which produces two live
+connectors from one YAML line.
 
 ### `accessories` and `warm_accessories`
 

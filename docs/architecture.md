@@ -86,8 +86,8 @@ decision function, or by the deployment shape.
    are exact names, never `*`. No container may be owned by two services. Two
    reconciles fighting over one container would start and stop it forever.
 5. **`restart: unless-stopped`, never `always`.** `always` resurrects a
-   connector conch deliberately stopped. That is the forbidden two-connectors
-   outcome delivered by one YAML line.
+   connector conch deliberately stopped. That produces two live connectors from
+   one YAML line.
 6. **The secret is the fence.** Every host authenticates with the shared secret.
    A compromised secret can claim leases. Treat it as a credential.
 7. **The decision function is pure.** No I/O in the policy. Time is injected.
@@ -108,7 +108,7 @@ case.
   removes the asymmetric-partition risk and makes the arbiter's availability the
   fleet's.
 
-Neither closes every failure. The [known gaps](known-gaps.md) page is the honest
+Neither closes every failure. The [known gaps](known-gaps.md) page is the full
 list.
 
 ## The label sweep
@@ -121,9 +121,9 @@ the app container.
 
 ## What this is not
 
-- **Not high availability.** Medium availability, best-effort: a bounded outage
-  on failover, and writes inside the replication-lag window are lost on
-  unplanned failover. That is the trade for free.
+- **Not high availability.** A bounded outage on failover, and writes inside the
+  replication-lag window are lost on unplanned failover. That is the cost of not
+  using a paid load balancer.
 - **Not a load balancer.** conch decides who may serve, never who gets a
   request. If it ever distributes requests, it has gone wrong.
 - **Not active/active.** Exactly one host serves each service.
@@ -146,5 +146,5 @@ can take the fleet down.
 ## Next
 
 - [Failover timing](failover-timing.md) for the default timeline.
-- [Known gaps](known-gaps.md) for the honest limitations.
+- [Known gaps](known-gaps.md) for the limitations.
 - [Arbiter backends](backends.md) for Cloudflare vs DynamoDB.

@@ -155,6 +155,6 @@ Start with [Troubleshooting](troubleshooting.md). The short version:
 - A service `ACTIVE` but the connector is down: check the connector's
   `restart` policy and the Docker daemon.
 - Both hosts `ACTIVE`: stop and read [Known gaps](known-gaps.md) first. That is
-  the forbidden outcome.
+  the outcome conch is built to prevent.
 - The disk warning fires: free space. A full disk wedges Docker in ways that
   make every other symptom worse.

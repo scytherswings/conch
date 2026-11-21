@@ -4,110 +4,136 @@
 [![Go](https://img.shields.io/github/go-mod/go-version/scytherswings/conch)](https://go.dev)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**A centralized lock for Cloudflare Tunnel connectors.** Two hosts run the same
-services; conch decides which one may serve each service, and moves it when that
-host stops being able to.
+Conch keeps one Cloudflare Tunnel connector live per service across two hosts.
+When the active host's service goes unhealthy, conch fails it over to the other
+host, so Cloudflare stops sending visitors to a dead service. It is built for
+[Kamal](https://kamal-deploy.org) deployments that run the same containers on two
+hosts.
 
-Cloudflare Tunnel routes traffic on *connector* liveness, not *service* health,
-and picks randomly among live connectors. Run connectors at two hosts, let one
-host's service die, and Cloudflare keeps sending traffic there — visitors get
-502s. conch makes connector liveness track service health: if a service is
-unhealthy here, conch stops its connector here and the edge routes to the other
-host. A Cloudflare Worker holds one lease per service so two connectors for the
-same service are never live at once.
+## Why this exists
+
+Cloudflare Tunnel routes traffic to any live connector. It does not check whether
+the service behind that connector is healthy. Run connectors on two hosts, let one
+host's service die, and Cloudflare keeps sending visitors to the dead host. They
+get 502s.
+
+Cloudflare's paid Load Balancing product fixes this. Conch is the open-source
+alternative: connector liveness follows service health. When a service is
+unhealthy on a host, conch stops that host's connector and the edge routes to the
+other host.
+
+Two connectors for one service must never be live at once. That is the failure
+conch exists to prevent. A small arbiter (a Cloudflare Worker with one Durable
+Object, or a DynamoDB table) holds one lease per service. Each host checks in
+every few seconds. A host may run a connector only while it holds the lease. When
+the lease expires, the other host can claim it.
 
 ```
-client → Cloudflare edge → tunnel(svc) → [ the ONE live connector ] → proxy → svc
-                                                  ▲
-                                   conch (one per host) ──── POST /batch ──── arbiter
-                                                                        (Worker + 1 DO)
+client -> Cloudflare edge -> tunnel(svc) -> the one live connector -> proxy -> svc
+                                                ^
+                                 conch (one per host) -- POST /batch --> arbiter
+                                                              (Worker + 1 DO)
 ```
 
 ## Quick start
 
-You need **two** hosts running your services in Docker, a Cloudflare account
-(free), and one tunnel per service. conch is designed and tested for two hosts;
-do not run it as a single-host tool.
+You need two hosts running your services in Docker, a Cloudflare account, and one
+tunnel per service. Conch is designed for two hosts. Do not run it as a
+single-host tool.
 
-```sh
-# 1. Deploy the arbiter (Cloudflare Worker + one Durable Object)
-cd arbiter && npm ci && npx wrangler deploy
-npx wrangler secret put CONCH_AUTH_SECRET   # same long random string on every host
+The normal path is Kamal. The full runbook is in
+[`deploy/README.md`](deploy/README.md).
 
-# 2. Build conch
-cd .. && go build -o conch ./cmd/conch
-# or: go install github.com/scytherswings/conch/cmd/conch@latest
-# or: docker build -t <your-registry>/conch:latest .
+1. Deploy the arbiter. It is a Cloudflare Worker with one Durable Object.
 
-# 3. Copy a config, set `host:`, `arbiter.url:`, and your services
-cp deploy/config.example.host-a.yml ./conch.yml
-./conch validate --config ./conch.yml
+   ```sh
+   cd arbiter
+   npm ci
+   npx wrangler deploy
+   npx wrangler secret put CONCH_AUTH_SECRET
+   ```
 
-# 4. Dry-run first: logs every decision, executes none, reads only
-CONCH_AUTH_SECRET=... ./conch run --config ./conch.yml --dry-run --socket ./admin.sock
+   Use the same secret on every host. Wrangler prints the Worker's URL.
 
-# 5. In another shell, ask what it thinks
-./conch status --socket ./admin.sock
-```
+2. Add the conch accessory to your Kamal `config/deploy.yml`. Start from
+   [`deploy/accessory-quick-start.yml`](deploy/accessory-quick-start.yml) or
+   [`deploy/conch-accessory.template.yml`](deploy/conch-accessory.template.yml).
+   Copy the matching host config from `deploy/` and set `host:`, the arbiter URL,
+   and your real services.
 
-Every service should report `"phase": "STANDBY"` and `"next_op": "read"` in the
-dry run — nothing claimed, nothing touched. That is the smoke test. Once conch
-has actually stopped something, the service also carries `last_stops`: one row
-per container, newest first, saying which rule asked for the stop and when. A
-row means conch asked for the stop and the stop was confirmed — the thing
-`docker ps` cannot tell you.
+3. Put `CONCH_AUTH_SECRET` and `TUNNEL_TOKEN` in `.kamal/secrets`.
 
-Connectors must be `restart: unless-stopped`, never `always`: `always`
-resurrects connectors conch deliberately stopped, which is the forbidden
-two-connectors outcome delivered by one YAML line.
+4. Validate the config. The pre-deploy hook in
+   [`deploy/hooks/pre-deploy-validate`](deploy/hooks/pre-deploy-validate) runs it
+   for you. Run it by hand with `conch validate --config ./conch.yml`; it lists
+   every fault, not just the first.
 
-## What this is not
+5. Boot the accessory on both hosts:
 
-- **Not high availability.** Medium availability, best-effort: a bounded outage
-  on failover, and writes inside the replication-lag window are lost on
-  *unplanned* failover. That is the trade for free.
-- **Not a load balancer.** conch decides who *may* serve, never who gets a
-  request.
-- **Not active/active.** Exactly one host serves each service.
-- **Not a database failover tool.** It orchestrates restores from replication you
-  already run; it takes no backups.
-- **Not a replacement for quorum.** Designed and tested for two hosts. At
-  three-plus, use real quorum tooling.
+   ```sh
+   kamal accessory boot conch
+   ```
 
-Read the [known gaps](docs/known-gaps.md) before trusting conch with anything
-you cannot lose. The first one is real: a dead or stuck conch with a healthy
-connector can still mean both hosts serve.
+6. Check `conch status`. Every service should be `STANDBY` with `next_op: read`.
+   That means conch has not claimed anything.
+
+Before booting for real, run the binary with `--dry-run` on a host. It logs every
+decision, performs no actions, and sends the arbiter only reads. See
+[`docs/quickstart.md`](docs/quickstart.md) for the manual path and the dry run.
+
+If you are not using Kamal, build with `go build -o conch ./cmd/conch` or
+`go install github.com/scytherswings/conch/cmd/conch@latest`, and run it with the
+same config. The Dockerfile builds a scratch image.
+
+## What conch is not
+
+- **Not high availability.** At the defaults, the lease timeline is about 78
+  seconds: a 60-second lease plus 6 good checks at 3 seconds each. Cloudflare's
+  own dead-connector detection adds to the real outage. Requests fail during that
+  window. On an unplanned failover, writes that have not reached the standby are
+  lost, because replication is asynchronous. If you need zero downtime or zero
+  data loss, use a real HA system.
+- **Not a load balancer.** It decides which host may serve, never which request
+  goes where.
+- **Not active/active.** One host serves each service.
+- **Not a database failover tool.** It runs the restore commands you configure.
+  It never promotes a database primary and takes no backups.
+- **Not a quorum system.** It is built and tested for two hosts. For three or
+  more, use real quorum tooling.
+
+Read [`docs/known-gaps.md`](docs/known-gaps.md) before you trust conch with
+anything you cannot lose. The first gap is real: a dead or stuck conch with a
+healthy connector can still mean both hosts serve.
 
 ## Documentation
 
-- [Quick start](docs/quickstart.md) — the full walkthrough.
-- [Configuration](docs/configuration.md) — every field and default.
-- [Deployment](docs/deployment.md) — Kamal accessory, binds, secret rotation.
-- [Operations](docs/operations.md) — status, evacuate, reclaim, upgrades.
-- [Architecture](docs/architecture.md) — the lease model and invariants.
-- [Failover timing](docs/failover-timing.md) — the default timeline and how to measure yours.
-- [Known gaps](docs/known-gaps.md) — the honest limitations.
-- [Arbiter backends](docs/backends.md) — Cloudflare Worker or DynamoDB.
-- [Security](docs/security.md) — trust boundaries and hardening.
-- [Troubleshooting](docs/troubleshooting.md) — symptoms and first checks.
-- [Development](docs/development.md) — build, test, and constraints.
-- [Examples](examples/README.md) — copyable configs and a compose file.
+- [Quick start](docs/quickstart.md)
+- [Configuration](docs/configuration.md)
+- [Deployment](docs/deployment.md)
+- [Operations](docs/operations.md)
+- [Architecture](docs/architecture.md)
+- [Failover timing](docs/failover-timing.md)
+- [Known gaps](docs/known-gaps.md)
+- [Arbiter backends](docs/backends.md)
+- [Security](docs/security.md)
+- [Troubleshooting](docs/troubleshooting.md)
+- [Development](docs/development.md)
+- [Examples](examples/README.md)
 
 ## Development
 
 ```sh
-make test          # Go + arbiter suites
-make build         # ./conch
-make lint          # gofmt + go vet
-make validate      # validate the shipped example configs
-make docker        # build the image
+make test        # Go and arbiter tests
+make build       # build ./conch
+make lint        # gofmt and go vet
+make validate    # validate the example configs
+make docker      # build the image
 ```
 
-CI runs the same checks on every push and pull request. Read
-[CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR — its constraints are
-load-bearing, not style. Everyone follows the [Code of Conduct](CODE_OF_CONDUCT.md);
-report a vulnerability privately via [SECURITY.md](SECURITY.md).
+CI runs the tests, vet, gofmt, example validation, a Docker build, and a secret
+scan. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the constraints. Security
+reports go through [`SECURITY.md`](SECURITY.md).
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [`LICENSE`](LICENSE).

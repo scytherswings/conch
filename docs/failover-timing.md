@@ -33,7 +33,7 @@ At defaults, host-a's uplink dying at t=0 just after a renew:
   Under the default `on_loss: freeze`, it stops the moment connectivity returns
   and its renew is refused.
 
-Two honesty notes on t≈78:
+Two caveats on t≈78:
 
 - **Ungraceful death.** On power loss or a kernel panic, the edge takes time to
   notice dead QUIC connections and keeps routing a share of requests to the
@@ -73,5 +73,5 @@ anything you cannot lose:
 3. Run a planned failover and time it end to end.
 4. Decide whether the user-visible window is acceptable.
 
-If it is not, the honest answer may be a paid load balancer or a real quorum
+If it is not, the answer may be a paid load balancer or a real quorum
 system, not a tighter `ttl`.

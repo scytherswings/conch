@@ -57,7 +57,7 @@ test that sleeps is a defect, not a slow test.
 socket client. The bug class is eliminated by construction, which is why nothing
 here observes conch for signs of life.
 
-**`--dry-run` must stay honest.** It logs every decision and the exact actions it
+**`--dry-run` must not perform actions.** It logs every decision and the exact actions it
 would take, executes none, and sends the arbiter only `read` ops — never `renew`
 or `release`, enforced by a test — so a dry run pointed at a production arbiter
 cannot claim a lease out from under the real active host. Any new action must

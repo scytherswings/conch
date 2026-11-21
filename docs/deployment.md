@@ -104,9 +104,9 @@ stops its connector and waits.
 ## Connector restart policy
 
 The connector must be `restart: unless-stopped`, never `always`. `always`
-resurrects a connector conch deliberately stopped, which is the forbidden
-two-connectors outcome delivered by one YAML line. This is the single most
-important deployment detail on this page.
+resurrects a connector conch deliberately stopped, which produces two live
+connectors from one YAML line. This is the single most important deployment
+detail on this page.
 
 ## Identity fields are immutable in place
 

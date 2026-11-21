@@ -17,8 +17,8 @@ quickest path to a running supervisor. These pages are the long version.
    function, and the invariants that keep two hosts from serving at once.
 6. **[Failover timing](failover-timing.md)** — the default timeline and how to
    measure your own.
-7. **[Known gaps](known-gaps.md)** — the honest limitations. Read this before
-   you trust conch with anything you cannot lose.
+7. **[Known gaps](known-gaps.md)** — the limitations. Read this before you trust
+   conch with anything you cannot lose.
 8. **[Arbiter backends](backends.md)** — Cloudflare Worker + Durable Object, or
    DynamoDB.
 9. **[Security](security.md)** — trust boundaries and operator hardening.

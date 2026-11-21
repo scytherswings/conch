@@ -44,7 +44,7 @@ The standby is healthy if it is not serving. Check in this order:
 
 ## Both hosts are `ACTIVE`
 
-That is the forbidden outcome. Stop one host's connector manually first. Then
+That is the outcome conch is built to prevent. Stop one host's connector manually first. Then
 find out why the lease was granted twice:
 
 - Was the arbiter reachable from both hosts? An asymmetric partition can let a

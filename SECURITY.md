@@ -49,9 +49,8 @@ These are the trust boundaries, and a break in one is a bug:
 
 ## What is *not* a vulnerability
 
-These are disclosed, documented behaviours — the [known gaps](docs/known-gaps.md)
-page calls them out by name, and they are the price of the best-effort design
-rather than defects:
+These are disclosed, documented behaviours. The [known gaps](docs/known-gaps.md)
+page calls them out by name. They are the cost of the design, not defects:
 
 - A **dead or stuck conch with a healthy connector** allows brief dual-serve
   until the lease expires and reconcile stops it.

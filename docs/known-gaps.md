@@ -1,11 +1,10 @@
 # Known gaps
 
-Stated without euphemism. Read this before you trust conch with anything you
-cannot lose.
+Read this before you trust conch with anything you cannot lose.
 
-conch is **medium availability, best-effort**. It is not high availability. It
-narrows the window in which two hosts both serve; it does not close it. The
-remaining window is the price of the free workaround.
+Conch is not high availability. It narrows the window in which two hosts both
+serve; it does not close it. The remaining gap is the cost of not using a paid
+load balancer.
 
 ## 1. A dead or stuck conch with a healthy connector means both hosts serve
 
@@ -26,8 +25,8 @@ not.
 ## 2. A wedged Docker daemon can leave a connector serving
 
 The stop runs through the same daemon whose failure (full disk, hung I/O) often
-triggered the demotion. conch escalates: `stop`, verify, `kill`, verify, then the
-loudest notification it has. A daemon that cannot kill a container leaves it up.
+triggered the demotion. conch escalates: `stop`, verify, `kill`, verify, then
+sends an alert. A daemon that cannot kill a container leaves it up.
 
 What narrows it: the disk warning and the escalation ladder. What does not close
 it: a daemon that cannot act.
@@ -72,12 +71,12 @@ removing the stopped container is still yours. See the rename procedure in
 ## When not to use conch
 
 - **You need high availability.** Use a real load balancer and a real quorum
-  system. conch is a free workaround, not a replacement for either.
+  system. conch is an open-source alternative, not a replacement for either.
 - **You have one host.** conch is designed and tested for two. A single-host
   deployment is a supervised container, not a failover system.
 - **You need active/active.** Exactly one host serves each service. That is the
   point.
 - **You cannot tolerate a bounded outage on failover.** Measure the window first.
-  If it is unacceptable, the honest answer may be a paid service.
+  If it is unacceptable, the answer may be a paid service.
 - **You need database failover.** conch orchestrates restores from replication
   you already run. It never promotes a database primary and takes no backups.

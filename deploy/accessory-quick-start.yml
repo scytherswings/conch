@@ -78,9 +78,8 @@
 # on the cloudflared accessory. `always` resurrects a connector Docker
 # thinks "should be running" independent of why it was stopped — including
 # the one time conch stopped it on purpose because this host lost the lease.
-# That is the forbidden two-connectors-serving outcome, delivered by one
-# YAML line. Leave `options:` off entirely, as below, and the safe default
-# holds.
+# That produces two live connectors from one YAML line. Leave `options:` off
+# entirely, as below, and the safe default holds.
 # ---------------------------------------------------------------------------
 
 accessories:
