@@ -40,10 +40,11 @@ const defaultSocket = "/run/conch/admin.sock"
 // dryRunBanner is spec §10's wording for a dry run: it logs every decision and
 // the actions it would take, executes none, and sends the arbiter only `read`
 // lease ops — never renew or release — so a dry run pointed at a live arbiter
-// cannot claim a lease out from under the real active host. "Lease ops" is
-// load-bearing: every batch still registers the host's presence, so a dry run is
-// a no-claim promise, not a no-write one (arbiter/src/lease.js batch()).
-const dryRunBanner = "DRY-RUN: decisions logged, nothing executed, arbiter lease ops are reads only (presence still recorded)"
+// cannot claim a lease out from under the real active host. It never claims a
+// lease on either backend. What it writes besides a claim differs: the
+// cloudflare batch still registers the host's presence, while the dynamo
+// client is constructed ReadOnly and writes nothing at all (no seed, no beat).
+const dryRunBanner = "DRY-RUN: decisions logged, nothing executed, arbiter lease ops are reads only (dynamo writes nothing; cloudflare records presence only)"
 
 // defaultLogLevel is what a host runs at: lifecycle, and anything degraded or
 // broken. The per-check decision lines are Debug, so a fleet that checks every
@@ -219,7 +220,12 @@ func cmdRun(args []string) int {
 			return 2
 		}
 		ddb := dynarbiter.NewDDB(cfg.Arbiter.Region, cfg.Arbiter.Endpoint, id, secret)
-		arb = dynarbiter.New(ddb, cfg.Arbiter.Table, cfg.Host, instance, cfg.Arbiter.TimeoutSeconds, clk)
+		dyn := dynarbiter.New(ddb, cfg.Arbiter.Table, cfg.Host, instance, cfg.Arbiter.TimeoutSeconds, clk)
+		// A dry run must not seed (which CREATES the table item) or beat
+		// (which peers read as liveness), so it points the dynamo client at
+		// read-only before its first poll.
+		dyn.ReadOnly = *dryRun
+		arb = dyn
 	default:
 		// config.Validate already refuses any backend but these two before
 		// cmdRun ever reaches here (the faults check above); this default

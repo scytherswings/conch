@@ -390,8 +390,10 @@ func TestSteadyStateIsOneReadOneWrite(t *testing.T) {
 // A host that only READS still has to say it is alive: presence is what
 // spec §9's evacuation pre-flight asks about ("is there a peer to hand this
 // to?") and what fingerprint-drift detection reads, and lease.js records it
-// on every /batch regardless of the ops in it. So every poll carries the
-// beat write, batched with whatever renews there are or on its own.
+// on every /batch regardless of the ops in it. So every ORDINARY poll —
+// all-read ops included — carries the beat write, batched with whatever
+// renews there are or on its own. The one exception is a --dry-run client
+// (ReadOnly, below): its poll writes nothing, seed and beat included.
 func TestReadOnlyPollStillWritesTheBeat(t *testing.T) {
 	f := newFakeDDB()
 	cd := &countingDDB{inner: f}
@@ -416,6 +418,38 @@ func TestReadOnlyPollStillWritesTheBeat(t *testing.T) {
 	if _, hosts := fleetState(t, f); hosts["host-b"].Beat != 2 {
 		t.Fatalf("beat did not advance on the second poll: %+v", hosts["host-b"])
 	}
+}
+
+// A --dry-run client must write nothing at all: seed is skipped (it CREATES
+// the fleet item and this host's row with if_not_exists) and so is the
+// presence beat (a real write peers read as liveness, which can satisfy their
+// evacuation pre-flight). Reads still happen, so the run reports what the
+// table says without changing it. A non-read op, which a dry run never sends,
+// fails closed rather than reaching a write.
+func TestADryRunPollWritesNothing(t *testing.T) {
+	f := newFakeDDB()
+	cd := &countingDDB{inner: f}
+	clk := clock.NewFake()
+	c := New(cd, "conch", "host-b", "inst-b", 5, clk)
+	c.ReadOnly = true
+
+	ops := map[string]arbiter.Op{"web": opRead, "api": opRenew}
+	reply := c.Batch(testTTL, "fp-b", ops)
+
+	if gets, updates := cd.counts(); gets != 1 || updates != 0 {
+		cd.mu.Lock()
+		defer cd.mu.Unlock()
+		t.Fatalf("dry run: got %d GetItem + %d UpdateItem, want 1 + 0 (%q)", gets, updates, cd.updateExpr)
+	}
+	f.mu.Lock()
+	items := len(f.items)
+	f.mu.Unlock()
+	if items != 0 {
+		t.Fatal("dry run created table state: seed must not run")
+	}
+	wantVerdict(t, reply, "web", decide.Free)
+	// The renew fails closed: no write, so no verdict can be earned.
+	wantVerdict(t, reply, "api", decide.Unreachable)
 }
 
 // A batched renew is capped so one fenced service costs a bounded number of

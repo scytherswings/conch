@@ -70,6 +70,14 @@ type Client struct {
 	timeout  float64
 	clk      clock.Clock
 
+	// ReadOnly makes Batch write nothing at all. seed() is skipped because it
+	// CREATES the fleet item and this host's row with if_not_exists, and the
+	// presence beat is skipped because it is a real write that peers read as
+	// liveness — one that can satisfy their evacuation pre-flight. A
+	// --dry-run supervisor sets this, so the run it previews mutates no table
+	// state. Set it once, before the first Batch.
+	ReadOnly bool
+
 	obs    *observer
 	seeded bool
 }
@@ -109,8 +117,10 @@ func (c *Client) Batch(ttl float64, fingerprint string, ops map[string]arbiter.O
 	// bad document path — a ValidationException, not a condition failure —
 	// and because the renew is one atomic UpdateItem that takes every
 	// service's version bump down with it.
-	if err := c.seed(me); err != nil {
-		return unreachableReply(ops, sentAt)
+	if !c.ReadOnly {
+		if err := c.seed(me); err != nil {
+			return unreachableReply(ops, sentAt)
+		}
 	}
 
 	// 3 + 4. One eventually-consistent read, decoded and folded into the
@@ -140,6 +150,29 @@ func (c *Client) Batch(ttl float64, fingerprint string, ops map[string]arbiter.O
 			renews = append(renews, renewSpecFor(key, ops[key], e))
 		default:
 			singles = append(singles, key)
+		}
+	}
+
+	// A read-only client stops here, before any write. Its whole reason to
+	// exist is that a --dry run must not mutate the table, and the only writes
+	// this poll could still send are the ones the dry run's all-read op set
+	// never asks for — the seed above is skipped for the same reason. Every op
+	// the supervisor sends in a dry run is a read (supervisor.go forces it),
+	// so classification already produced a final verdict for each key; a
+	// non-read action, which a dry run never sends, fails closed to Unreachable
+	// rather than reaching a write.
+	if c.ReadOnly {
+		for _, key := range sortedKeys(ops) {
+			if acts[key].Kind != actNone {
+				verdicts[key] = arbiter.Verdict{Lease: decide.Unreachable}
+			}
+		}
+		peers, fingerprints := c.presence(observedAt, hosts)
+		return arbiter.Reply{
+			Services:     verdicts,
+			Peers:        peers,
+			Fingerprints: fingerprints,
+			SentAt:       sentAt,
 		}
 	}
 
