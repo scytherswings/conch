@@ -12,7 +12,7 @@ quickest path to a running supervisor. These pages are the long version.
 3. **[Deployment](deployment.md)** — the Kamal accessory paths, the two Docker
    binds, secret rotation, and the pre-deploy hook.
 4. **[Operations](operations.md)** — day-2 commands: status, evacuate, reclaim,
-   inventory, upgrades, and planned maintenance.
+   fleet inventory, upgrades, and planned maintenance.
 5. **[Architecture](architecture.md)** — the lease model, the pure decision
    function, and the invariants that keep two hosts from serving at once.
 6. **[Failover timing](failover-timing.md)** — the default timeline and how to

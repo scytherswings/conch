@@ -186,23 +186,29 @@ host, and the breakage only shows up when someone needs the standby most.
 "Which sites depend on conch?" is not answered by a list in this repo, and it
 shouldn't be — that list would go stale the first time the fleet changes (a
 renamed or removed service, a site moved to active-active), and the real
-answers live a repo or two away anyway. The running fleet answers for itself:
-[`deploy/inventory`](./inventory) reads `conch status` out of each host's conch
-container and prints what to depend on:
+answers live a repo or two away anyway. The running fleet answers for itself.
+Every host already checks in to the arbiter, and the arbiter serves a read-only
+view of that state:
 
 ```sh
-deploy/inventory you@host-a you@host-b              # auto-finds each host's conch container
-deploy/inventory host-a:conch-host-a                # or name it explicitly
+# from anywhere that holds the arbiter URL and the secret:
+conch fleet --arbiter https://<your-worker>.workers.dev
+conch fleet --arbiter https://<your-worker>.workers.dev --json   # machine-readable
+
+# or read the endpoint directly:
+curl -s -H "X-Conch-Auth: $CONCH_AUTH_SECRET" https://<your-worker>.workers.dev/fleet | jq
 ```
 
-For every host it prints the services that host supervises with phase and
-lease, the peer map, and any `last_stops` evidence. A service supervised on any
-host is a service that depends on conch; a site absent from every host's
-status is not supervised and may well be served active-active with no conch
-involvement. A host that is unreachable shows up as **UNREACHABLE** rather than
-vanishing from the output — a box that is genuinely down is a finding, not an
-absence. Keep hostnames out of the repo (CONTRIBUTING) and pass them on the
-command line, exactly as everything else in this runbook does.
+It prints every service with its holder and whether it is serving, then every
+live host and the services it supervises. A service supervised on any host is a
+service that depends on conch; a site absent from every host is not supervised
+and may well be served active-active with no conch involvement.
+
+Run it **on a host** (`conch fleet --socket /run/conch/admin.sock`) to merge
+that host's own config and see drift — a lease that no host supervises. The read
+is observation only: it claims, renews, and releases nothing, so it is safe
+against a production arbiter. Keep hostnames out of the repo (CONTRIBUTING) and
+pass them on the command line, exactly as everything else in this runbook does.
 
 ### Validate before you deploy
 
@@ -250,6 +256,12 @@ The arbiter itself holds the accepted secret(s) as Cloudflare Worker secrets, se
 ```sh
 wrangler secret put CONCH_AUTH_SECRET
 ```
+
+> **Deploying arbiter code:** Durable Objects defer code updates by default (up
+> to 5 minutes), and the arbiter's object is polled every few seconds so it
+> never idles and never picks up the new code on its own. Deploy with
+> `wrangler deploy --durable-objects-code-update-mode immediate` to apply a
+> change right away.
 
 ### Rotation
 
@@ -350,7 +362,7 @@ lives at `/conch` (the entrypoint), and its container is named `conch` when the 
 `service: conch`, as both templates do. A project that overrides `service:` names its container
 after that (`conch-host-a` under service `conch` may become `<app>-conch-a` under service
 `<app>`), so the safe spelling that works under any name is `docker exec <name> /conch
-status` — or let [`deploy/inventory`](./inventory) find the name for you.
+status` — or run `conch fleet` to see every host and the services it supervises.
 
 ## The replication-sidecar warning
 

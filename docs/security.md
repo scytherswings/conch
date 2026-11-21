@@ -46,6 +46,18 @@ Treat these as code:
 - If you use DynamoDB, give the IAM user least privilege on the one table. The
   bootstrap script creates the user and prints the credentials once.
 
+### The fleet read endpoint
+
+`GET /fleet` returns the arbiter's lease and host maps — service keys, holders,
+whether each is serving, host fingerprints and last-seen, and the services each
+host supervises. It is **read-only**: it performs no write, creates no lease,
+and records no presence. It is authenticated with the same `X-Conch-Auth` secret
+as `/batch` (constant-time, two-secret rotation); an unauthenticated request is
+`401` and costs only a Worker request. Anyone holding the secret can already
+claim leases, so the endpoint adds no new authority — but it does expose your
+service and host names to a secret holder, so the secret remains the boundary.
+`conch fleet` reads this endpoint.
+
 ## The Docker socket
 
 The conch container drives Docker. That means:

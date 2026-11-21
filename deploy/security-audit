@@ -8,7 +8,8 @@
 # from cron, CI, or a scheduled agent task and page on drift. It answers the two
 # questions that actually rot: "is the host still hardened the way we left it?"
 # and "is anything we run now off the version we intend?". Keep real hostnames
-# out of the repo (CONTRIBUTING); pass them on the command line, like deploy/inventory.
+# out of the repo (CONTRIBUTING); pass them on the command line, as everything
+# else in this runbook does.
 set -eu
 
 TARGET_RUBY="${TARGET_RUBY:-4.0.10}"

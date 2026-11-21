@@ -100,17 +100,20 @@ connector images differ; keep the supervisor images in step too.
 
 ## Fleet inventory
 
-[`deploy/inventory`](../deploy/inventory) reads `conch status` out of each
-host's conch container and prints one block per host. Pass SSH targets on the
-command line; keep real hostnames out of the repo.
+The fleet reports itself. `conch fleet` asks the arbiter for the whole fleet —
+every service with its holder and whether it is serving, and every live host
+with the services it supervises:
 
 ```sh
-deploy/inventory you@host-a you@host-b
-deploy/inventory host-a:conch-host-a        # explicit conch container
+# from anywhere, with the arbiter URL and the secret:
+conch fleet --arbiter https://<your-worker>.workers.dev
+conch fleet --arbiter https://<your-worker>.workers.dev --json   # machine-readable
 ```
 
-An unreachable host is reported as unreachable, not omitted. A host that is
-genuinely down shows up as down.
+Run on a host, it also merges that host's config and flags a lease that no host
+supervises (post-rename drift). The read is observation only — it never claims,
+renews, or releases a lease, so it is safe against a production arbiter. Keep
+real hostnames out of the repo; pass the URL and secret, not a site list.
 
 ## Security audit
 

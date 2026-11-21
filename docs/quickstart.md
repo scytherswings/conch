@@ -37,6 +37,12 @@ host.
 > changes. A dedicated Cloudflare account is recommended: the free tier's
 > request meter is shared with everything else in the account.
 
+> **Updating the arbiter later:** Durable Objects defer code updates by default
+> — up to 5 minutes — and an object that is never idle keeps the old code until
+> that timer expires. The arbiter is polled every few seconds, so it never idles:
+> deploy with `npx wrangler deploy --durable-objects-code-update-mode immediate`
+> to apply a Worker change right away.
+
 ## 2. Build conch
 
 From the repository root:
@@ -147,5 +153,5 @@ binary with the right binds. See [Deployment](deployment.md).
 - Read [Known gaps](known-gaps.md) before you trust it with stateful data.
 - Read [Deployment](deployment.md) for the Kamal accessory path, the two binds,
   and secret rotation.
-- Read [Operations](operations.md) for evacuate, reclaim, inventory and
+- Read [Operations](operations.md) for evacuate, reclaim, fleet inventory and
   upgrades.
