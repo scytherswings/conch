@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/scytherswings/conch/internal/arbiter"
 	"github.com/scytherswings/conch/internal/supervisor"
 )
 
@@ -27,6 +28,7 @@ const gateTimeout = 5 * time.Second
 type stub struct {
 	mu         sync.Mutex
 	status     map[string]any
+	fleetReply *arbiter.FleetReply
 	events     chan supervisor.EvacEvent
 	evacErr    error
 	reclaimErr error
@@ -49,6 +51,20 @@ func (s *stub) Status() map[string]any {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.status
+}
+
+func (s *stub) Fleet(ctx context.Context) supervisor.FleetView {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	view := supervisor.FleetView{
+		Host:           "host-a",
+		SupervisedHere: []string{"web", "blog"},
+		Peers:          map[string]float64{"host-b": 2.5},
+	}
+	if s.fleetReply != nil {
+		view.Arbiter = s.fleetReply
+	}
+	return view
 }
 
 func (s *stub) Evacuate(services []string, all, hold, force bool) (<-chan supervisor.EvacEvent, error) {
@@ -155,6 +171,38 @@ func TestStatusReportsEveryService(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Fatalf("the status snapshot is missing peer presence %q: %s", want, out)
 		}
+	}
+}
+
+// TestFleetReportsTheLocalViewOverTheSocket pins the local read: this host's
+// services and peers plus the arbiter's snapshot the supervisor merged in,
+// all the way out through the client. The shape is the supervisor's FleetView,
+// not the arbiter's bare reply — local mode exists to show both sides.
+func TestFleetReportsTheLocalViewOverTheSocket(t *testing.T) {
+	b := newStub()
+	holder := "host-b"
+	b.fleetReply = &arbiter.FleetReply{
+		GeneratedAt: 42,
+		Services:    map[string]arbiter.FleetService{"web": {Holder: &holder, Serving: true, Epoch: 1}},
+		Hosts:       map[string]arbiter.FleetHost{},
+	}
+	cli, _ := serve(t, b)
+
+	view, err := cli.Fleet()
+	if err != nil {
+		t.Fatalf("Fleet: %v", err)
+	}
+	if view.Host != "host-a" {
+		t.Fatalf("host: got %q", view.Host)
+	}
+	if len(view.SupervisedHere) != 2 || view.SupervisedHere[0] != "web" {
+		t.Fatalf("supervised_here: got %v", view.SupervisedHere)
+	}
+	if view.Peers["host-b"] != 2.5 {
+		t.Fatalf("peers: got %v", view.Peers)
+	}
+	if view.Arbiter == nil || view.Arbiter.GeneratedAt != 42 {
+		t.Fatalf("the arbiter snapshot did not survive: %+v", view.Arbiter)
 	}
 }
 

@@ -11,7 +11,10 @@ package arbiter
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -60,6 +63,48 @@ type Reply struct {
 	SentAt       float64
 }
 
+// FleetReply is the whole fleet as GET /fleet renders it: every service the
+// arbiter knows of, and every host still inside its presence window. It is a
+// pure read — fetching it claims no lease and records no presence — so unlike
+// a batch it speaks for no host, and can be asked from anywhere that holds the
+// fleet secret (D5).
+type FleetReply struct {
+	GeneratedAt int64                   `json:"generatedAt"`
+	Services    map[string]FleetService `json:"services"`
+	Hosts       map[string]FleetHost    `json:"hosts"`
+}
+
+// FleetService is one key's inventory row. A nil Holder is a free lease, not
+// an empty host name: the arbiter renders a never-claimed key and a lapsed one
+// the same way, and this client must not invent a holder for either. A nil
+// ExpiresIn is "no deadline to report" (a free lease, or a lease whose expiry
+// the arbiter chose not to state), never a deadline of zero.
+type FleetService struct {
+	Holder      *string  `json:"holder"`
+	Serving     bool     `json:"serving"`
+	Epoch       int      `json:"epoch"`
+	ExpiresIn   *float64 `json:"expiresIn"`
+	EvacuatedBy *string  `json:"evacuatedBy"`
+	Barred      bool     `json:"barred"`
+	Conflict    *string  `json:"conflict"`
+}
+
+// FleetHost is one host's inventory row: how long since it last checked in,
+// the image fingerprint it last reported, and the valid service keys it last
+// sent. Services is the host's stated intent — what it says it supervises —
+// and is not a claim about who holds a lease.
+type FleetHost struct {
+	LastSeenAgo float64  `json:"lastSeenAgo"`
+	Fingerprint *string  `json:"fingerprint"`
+	Services    []string `json:"services"`
+}
+
+// ErrNoFleet is the arbiter's 404 for a route it does not serve: the fleet
+// endpoint is newer than this deployment, or the backend never offers it
+// (D8). It is a distinct error so a caller can say "upgrade the arbiter"
+// rather than report an indistinguishable transport failure.
+var ErrNoFleet = errors.New("the arbiter does not expose /fleet; upgrade it first")
+
 // Client is one host's connection to the arbiter: one URL, one auth secret,
 // one identity (host, instance) it stamps on every request, and one
 // http.Client whose Timeout is the sole deadline enforcement — no per-call
@@ -106,6 +151,72 @@ func batchURL(url string) string {
 		return trimmed
 	}
 	return trimmed + "/batch"
+}
+
+// fleetURL normalises an arbiter url into the path GET /fleet lives on. New
+// stores its client's url already ending in "/batch", so a Client built by New
+// and then asked for Fleet would GET the batch path — a write path, and a 405
+// to a GET — which this client would misreport as an arbiter too old. Stripping
+// it is the whole reason this derivation exists. A url that already ends in
+// "/fleet" is left alone; anything else gets "/fleet" appended, matching
+// batchURL's tolerance of both config styles.
+func fleetURL(url string) string {
+	trimmed := strings.TrimRight(url, "/")
+	switch {
+	case strings.HasSuffix(trimmed, "/batch"):
+		return strings.TrimSuffix(trimmed, "/batch") + "/fleet"
+	case strings.HasSuffix(trimmed, "/fleet"):
+		return trimmed
+	default:
+		return trimmed + "/fleet"
+	}
+}
+
+// NewFleet builds a read-only Client for GET /fleet. It carries no host and no
+// instance: a fleet read speaks for no host and claims nothing, so there is no
+// identity to stamp on it. url is normalised once, here, exactly as New
+// normalises a base url; timeout is seconds, bounded by the same http.Client
+// Timeout a batch uses.
+func NewFleet(url, secret string, timeout float64, clk clock.Clock) *Client {
+	return &Client{
+		url:    fleetURL(url),
+		secret: secret,
+		http:   &http.Client{Timeout: time.Duration(timeout * float64(time.Second))},
+		clk:    clk,
+	}
+}
+
+// Fleet performs one GET /fleet and decodes the inventory. Unlike Batch, which
+// answers per requested key and so can fail closed key by key, a fleet read
+// answers or it does not: any transport failure, a non-200, or a body that
+// will not parse is an error, and no partial list is ever fabricated from a
+// response the arbiter did not actually send. A 404 is ErrNoFleet, the one
+// failure worth its own name.
+func (c *Client) Fleet(ctx context.Context) (FleetReply, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fleetURL(c.url), nil)
+	if err != nil {
+		return FleetReply{}, err
+	}
+	req.Header.Set("X-Conch-Auth", c.secret)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return FleetReply{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return FleetReply{}, ErrNoFleet
+	}
+	if resp.StatusCode != http.StatusOK {
+		return FleetReply{}, fmt.Errorf("the arbiter answered %s to a fleet request", resp.Status)
+	}
+
+	var reply FleetReply
+	if err := json.NewDecoder(resp.Body).Decode(&reply); err != nil {
+		return FleetReply{}, fmt.Errorf("the arbiter's fleet reply did not parse: %w", err)
+	}
+	return reply, nil
 }
 
 // requestBody is Appendix A's request shape.

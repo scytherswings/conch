@@ -11,12 +11,15 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -58,7 +61,16 @@ const usage = `conch: one binary, the supervisor and its admin surface (spec §1
   conch status   [--socket ` + defaultSocket + `]
   conch evacuate <service...|--all> [--hold] [--force] [--socket ` + defaultSocket + `]
   conch reclaim  <service> [--socket ` + defaultSocket + `]
+  conch fleet    --arbiter <url> [--secret-env <VAR> | --secret-file <path>] [--timeout 5] [--json]
+  conch fleet    --socket ` + defaultSocket + ` [--json]
 `
+
+// defaultFleetTimeout is `conch fleet`'s own deadline for one GET /fleet. It
+// is a constant rather than a config value because remote mode has no config
+// file to read (D5): five seconds matches the arbiter client's own configured
+// default and is generous for one small JSON read, while still failing a
+// terminal rather than hanging it.
+const defaultFleetTimeout = 5.0
 
 func main() {
 	os.Exit(run(os.Args[1:]))
@@ -85,6 +97,8 @@ func run(args []string) int {
 		return cmdEvacuate(rest)
 	case "reclaim":
 		return cmdReclaim(rest)
+	case "fleet":
+		return cmdFleet(rest)
 	case "-h", "-help", "--help", "help":
 		fmt.Fprint(os.Stdout, usage)
 		return 0
@@ -205,6 +219,10 @@ func cmdRun(args []string) int {
 	dk := dockerapi.New(cfg.Docker.Socket, cfg.Docker.TimeoutSeconds)
 
 	var arb arbiterBackend
+	// fleet is the optional read capability `conch fleet --socket` uses. Only
+	// the cloudflare client has GET /fleet; dynamo leaves this nil, and the
+	// local view reports that rather than failing (D8).
+	var fleet supervisor.FleetReader
 	switch cfg.Arbiter.Backend {
 	case "cloudflare":
 		secret, err := readSecret(cfg.Arbiter)
@@ -212,7 +230,9 @@ func cmdRun(args []string) int {
 			fmt.Fprintf(os.Stderr, "run: %s\n", err)
 			return 2
 		}
-		arb = arbiter.New(cfg.Arbiter.URL, secret, cfg.Host, instance, cfg.Arbiter.TimeoutSeconds, clk)
+		client := arbiter.New(cfg.Arbiter.URL, secret, cfg.Host, instance, cfg.Arbiter.TimeoutSeconds, clk)
+		arb = client
+		fleet = client
 	case "dynamo":
 		id, secret, err := dynarbiter.LoadCreds(cfg.Arbiter.CredentialsFile)
 		if err != nil {
@@ -240,6 +260,7 @@ func cmdRun(args []string) int {
 	sup, err := supervisor.New(supervisor.Options{
 		Config:   cfg,
 		Arbiter:  arb,
+		Fleet:    fleet,
 		Docker:   dk,
 		Hooks:    hk,
 		Clock:    clk,
@@ -444,4 +465,211 @@ func cmdReclaim(args []string) int {
 	}
 	fmt.Fprintln(os.Stdout, "reclaimed")
 	return 0
+}
+
+// cmdFleet is spec §10's `conch fleet`: the fleet's inventory, read from the
+// arbiter with no config file, no admin socket, no container and no checkout
+// (D5). Remote mode is self-contained on purpose — it constructs its own
+// arbiter client and never touches the supervisor, because the inventory is a
+// read and the supervisor is the thing that writes leases. The credential and
+// the URL are the whole of what it needs, which is exactly what the operator
+// who created the fleet already holds.
+func cmdFleet(args []string) int {
+	fs := flag.NewFlagSet("fleet", flag.ContinueOnError)
+	arbiterURL := fs.String("arbiter", "",
+		"the arbiter base URL, e.g. https://conch-lease.example.workers.dev")
+	secretEnv := fs.String("secret-env", "CONCH_AUTH_SECRET",
+		"name of the environment variable holding the fleet secret (default CONCH_AUTH_SECRET)")
+	secretFile := fs.String("secret-file", "", "path to a file holding the fleet secret")
+	timeout := fs.Float64("timeout", defaultFleetTimeout, "seconds to wait for the arbiter's answer")
+	asJSON := fs.Bool("json", false, "print the reply as JSON instead of a summary")
+	socketPath := fs.String("socket", "",
+		"read this host's local view over an admin socket instead of the arbiter (e.g. "+defaultSocket+")")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *socketPath != "" {
+		// Local mode: this host's supervisor answers, merging what it knows
+		// with the arbiter's snapshot when it can reach one. It works while
+		// the arbiter is down, which is the counter-argument's whole answer
+		// (see the plan): the incident tool stays `conch status`, and this
+		// merger degrades to the local view with a note.
+		return fleetLocal(*socketPath, *asJSON)
+	}
+	if *arbiterURL == "" {
+		fmt.Fprintln(os.Stderr,
+			"fleet: --arbiter is required (or --socket for this host's local view), e.g. "+
+				"conch fleet --arbiter https://conch-lease.example.workers.dev")
+		return 2
+	}
+
+	// The secret rules are the config's own (arbiter.secret_env then
+	// arbiter.secret_file): reusing readSecret keeps remote mode's one
+	// credential story identical to the host's, so an operator does not learn
+	// a second way to spell the same secret.
+	secret, err := readSecret(config.ArbiterConfig{SecretEnv: *secretEnv, SecretFile: *secretFile})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "fleet: %s\n", err)
+		return 2
+	}
+
+	client := arbiter.NewFleet(*arbiterURL, secret, *timeout, clock.NewSystem())
+	reply, err := client.Fleet(context.Background())
+	if err != nil {
+		// ErrNoFleet carries its own "upgrade it first"; every other failure
+		// is transport or parse, and neither is a partial table: nothing has
+		// been printed yet, so a non-zero exit leaves the operator with the
+		// error and no half-inventory to misread.
+		fmt.Fprintf(os.Stderr, "fleet: %s\n", err)
+		return 1
+	}
+
+	if *asJSON {
+		out, err := json.MarshalIndent(reply, "", "  ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "fleet: %s\n", err)
+			return 1
+		}
+		fmt.Fprintln(os.Stdout, string(out))
+		return 0
+	}
+	renderFleet(os.Stdout, reply)
+	return 0
+}
+
+// fleetLocal is `conch fleet --socket`: this host's supervisor answers over
+// the admin socket. The supervisor always has a view — an unreachable arbiter
+// or a backend without a fleet endpoint is a note inside it — so the only
+// failure here is the one every admin verb shares: no supervisor behind the
+// socket. A reachable supervisor therefore exits 0 even while the arbiter is
+// down, which is the graceful degradation the plan's counter-argument wants.
+func fleetLocal(socketPath string, asJSON bool) int {
+	view, err := (admin.CLI{Socket: socketPath}).Fleet()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "fleet: %s\n", err)
+		return 1
+	}
+	if asJSON {
+		out, err := json.MarshalIndent(view, "", "  ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "fleet: %s\n", err)
+			return 1
+		}
+		fmt.Fprintln(os.Stdout, string(out))
+		return 0
+	}
+	renderFleetLocal(os.Stdout, view)
+	return 0
+}
+
+// renderFleetLocal prints the local view: what this host supervises and sees,
+// then — when the supervisor reached one — the arbiter's full snapshot, then
+// the drift probe and any note. It reuses renderFleet for the arbiter half, so
+// remote and local agree on how a fleet reads; the only addition is the
+// this-host header above it and the drift line below it.
+func renderFleetLocal(w io.Writer, view supervisor.FleetView) {
+	supervised := "nothing"
+	if len(view.SupervisedHere) > 0 {
+		supervised = strings.Join(view.SupervisedHere, ", ")
+	}
+	fmt.Fprintf(w, "host: %s\n", view.Host)
+	fmt.Fprintf(w, "supervised here (%d): %s\n", len(view.SupervisedHere), supervised)
+
+	peers := "none"
+	if len(view.Peers) > 0 {
+		names := make([]string, 0, len(view.Peers))
+		for name := range view.Peers {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		rows := make([]string, 0, len(names))
+		for _, name := range names {
+			rows = append(rows, fmt.Sprintf("%s %.1fs ago", name, view.Peers[name]))
+		}
+		peers = strings.Join(rows, ", ")
+	}
+	fmt.Fprintf(w, "peers (%d): %s\n", len(view.Peers), peers)
+
+	if view.Arbiter != nil {
+		renderFleet(w, *view.Arbiter)
+	} else {
+		fmt.Fprintln(w, "arbiter: no snapshot")
+	}
+	if len(view.Unsupervised) > 0 {
+		fmt.Fprintf(w, "drift, leases no host supervises: %s\n", strings.Join(view.Unsupervised, ", "))
+	}
+	if view.Note != "" {
+		fmt.Fprintf(w, "note: %s\n", view.Note)
+	}
+}
+
+// renderFleet prints an inventory for a human: every service, then every host.
+// Services come first because "who is serving what" is the question this
+// command exists to answer; hosts are the supporting detail of who is alive
+// and what each one last said it supervises. Both lists are sorted, so two
+// reads of an unchanged fleet print identically.
+func renderFleet(w io.Writer, reply arbiter.FleetReply) {
+	fmt.Fprintf(w, "services (%d):\n", len(reply.Services))
+	for _, key := range sortedServiceKeys(reply.Services) {
+		s := reply.Services[key]
+		holder := "free"
+		if s.Holder != nil {
+			holder = *s.Holder
+		}
+		serving := "standby"
+		if s.Serving {
+			serving = "serving"
+		}
+		var flags []string
+		if s.ExpiresIn != nil {
+			flags = append(flags, fmt.Sprintf("expires in %.1fs", *s.ExpiresIn))
+		}
+		if s.Barred {
+			flags = append(flags, "barred")
+		}
+		if s.EvacuatedBy != nil {
+			flags = append(flags, "evacuated by "+*s.EvacuatedBy)
+		}
+		if s.Conflict != nil {
+			flags = append(flags, "conflict with "+*s.Conflict)
+		}
+		fmt.Fprintf(w, "  %-16s %-16s %-8s", key, holder, serving)
+		if len(flags) > 0 {
+			fmt.Fprintf(w, "  (%s)", strings.Join(flags, ", "))
+		}
+		fmt.Fprintln(w)
+	}
+
+	fmt.Fprintf(w, "hosts (%d):\n", len(reply.Hosts))
+	for _, name := range sortedHostNames(reply.Hosts) {
+		h := reply.Hosts[name]
+		fingerprint := ""
+		if h.Fingerprint != nil {
+			fingerprint = "  fingerprint " + *h.Fingerprint
+		}
+		supervises := "nothing"
+		if len(h.Services) > 0 {
+			supervises = strings.Join(h.Services, ", ")
+		}
+		fmt.Fprintf(w, "  %-16s last seen %.1fs ago%s  supervises %s\n",
+			name, h.LastSeenAgo, fingerprint, supervises)
+	}
+}
+
+func sortedServiceKeys(m map[string]arbiter.FleetService) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func sortedHostNames(m map[string]arbiter.FleetHost) []string {
+	names := make([]string, 0, len(m))
+	for name := range m {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }

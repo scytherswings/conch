@@ -1,7 +1,9 @@
 package arbiter_test
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -270,5 +272,170 @@ func TestRequestBodyIsMinimalAndCarriesIdentity(t *testing.T) {
 		if _, present := web[field]; present {
 			t.Fatalf("services.web.%s: must be omitted when zero, got %+v", field, web[field])
 		}
+	}
+}
+
+// A Client built by New holds a url already ending in /batch (batchURL).
+// Fleet must strip that and GET /fleet: a naive GET would hit the batch path,
+// whose 405 this client would misreport as "the arbiter does not expose
+// /fleet". The handler 405s anything that is not /fleet so the assertion
+// cannot pass by accident.
+func TestFleetFromABatchClientStripsTheBatchPath(t *testing.T) {
+	var path string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		if r.URL.Path != "/fleet" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		io.WriteString(w, `{"generatedAt":1,"services":{},"hosts":{}}`)
+	}))
+	defer srv.Close()
+	_, err := arbiter.New(srv.URL, "s", "host-a", "i1", 1, clock.NewFake()).
+		Fleet(context.Background())
+	if err != nil {
+		t.Fatalf("Fleet: %v", err)
+	}
+	if path != "/fleet" {
+		t.Fatalf("Fleet must GET /fleet, it hit %q", path)
+	}
+}
+
+// Both config styles New tolerates must normalise to /fleet for a fleet
+// client too: a bare base url, a trailing slash, an explicit /batch, and an
+// explicit /fleet all land on exactly /fleet, never /fleet/batch or
+// /batch/fleet.
+func TestFleetURLNormalizationAcceptsEveryConfigStyle(t *testing.T) {
+	var got []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = append(got, r.URL.Path)
+		if r.URL.Path != "/fleet" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		io.WriteString(w, `{"generatedAt":1,"services":{},"hosts":{}}`)
+	}))
+	defer srv.Close()
+
+	for _, url := range []string{srv.URL, srv.URL + "/", srv.URL + "/batch", srv.URL + "/fleet"} {
+		if _, err := arbiter.NewFleet(url, "s", 1, clock.NewFake()).Fleet(context.Background()); err != nil {
+			t.Fatalf("url %q: Fleet: %v", url, err)
+		}
+	}
+	for _, p := range got {
+		if p != "/fleet" {
+			t.Fatalf("want every request to hit exactly /fleet, got path %q (all: %v)", p, got)
+		}
+	}
+}
+
+// The frozen /fleet shape decodes field for field, including the three that
+// are null rather than absent: a free lease's holder, a lease with no stated
+// deadline, and a host's fingerprint. Pointer fields keep "null" distinct
+// from a zero value the arbiter never sent.
+func TestFleetDecodesTheInventory(t *testing.T) {
+	var method, auth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method, auth = r.Method, r.Header.Get("X-Conch-Auth")
+		io.WriteString(w, `{"generatedAt":1795152221297,
+          "services":{
+            "web":{"holder":"host-a","serving":true,"epoch":12,"expiresIn":8.4,"evacuatedBy":null,"barred":false,"conflict":null},
+            "blog":{"holder":null,"serving":false,"epoch":3,"expiresIn":null,"evacuatedBy":null,"barred":false,"conflict":null},
+            "store":{"holder":"host-b","serving":false,"epoch":5,"expiresIn":2.0,"evacuatedBy":"host-c","barred":true,"conflict":"host-b"}},
+          "hosts":{
+            "host-a":{"lastSeenAgo":1.2,"fingerprint":"ab12","services":["web","blog"]},
+            "host-b":{"lastSeenAgo":9.9,"fingerprint":null,"services":[]}}}`)
+	}))
+	defer srv.Close()
+
+	reply, err := arbiter.NewFleet(srv.URL+"/batch", "topsecret", 1, clock.NewFake()).
+		Fleet(context.Background())
+	if err != nil {
+		t.Fatalf("Fleet: %v", err)
+	}
+	if method != http.MethodGet {
+		t.Fatalf("a fleet read must be a GET, got %s", method)
+	}
+	if auth != "topsecret" {
+		t.Fatalf("X-Conch-Auth: got %q", auth)
+	}
+	if reply.GeneratedAt != 1795152221297 {
+		t.Fatalf("generatedAt: got %d", reply.GeneratedAt)
+	}
+
+	web := reply.Services["web"]
+	if web.Holder == nil || *web.Holder != "host-a" || !web.Serving || web.Epoch != 12 {
+		t.Fatalf("web: got %+v", web)
+	}
+	if web.ExpiresIn == nil || *web.ExpiresIn != 8.4 {
+		t.Fatalf("web expiresIn: got %v", web.ExpiresIn)
+	}
+	if web.Barred || web.EvacuatedBy != nil || web.Conflict != nil {
+		t.Fatalf("web: free of flags, got %+v", web)
+	}
+
+	blog := reply.Services["blog"]
+	if blog.Holder != nil {
+		t.Fatalf("a free lease's holder must decode as nil, got %q", *blog.Holder)
+	}
+	if blog.ExpiresIn != nil {
+		t.Fatalf("a free lease's expiresIn must decode as nil, got %v", *blog.ExpiresIn)
+	}
+
+	store := reply.Services["store"]
+	if !store.Barred || store.EvacuatedBy == nil || *store.EvacuatedBy != "host-c" {
+		t.Fatalf("store: got %+v", store)
+	}
+	if store.Conflict == nil || *store.Conflict != "host-b" {
+		t.Fatalf("store conflict: got %v", store.Conflict)
+	}
+
+	host := reply.Hosts["host-a"]
+	if host.LastSeenAgo != 1.2 || host.Fingerprint == nil || *host.Fingerprint != "ab12" {
+		t.Fatalf("host-a: got %+v", host)
+	}
+	if len(host.Services) != 2 || host.Services[0] != "web" {
+		t.Fatalf("host-a services: got %v", host.Services)
+	}
+	if reply.Hosts["host-b"].Fingerprint != nil {
+		t.Fatalf("a null fingerprint must decode as nil, got %q", *reply.Hosts["host-b"].Fingerprint)
+	}
+}
+
+// The arbiter's 404 is the one failure that means "this deployment has no
+// /fleet", and it must be its own error so a caller can say "upgrade it"
+// rather than report a transport failure. A 500 is a different thing
+// entirely and must NOT be ErrNoFleet.
+func TestFleet404IsNoFleetAndOtherErrorsAreNot(t *testing.T) {
+	notFound := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer notFound.Close()
+	_, err := arbiter.NewFleet(notFound.URL, "s", 1, clock.NewFake()).Fleet(context.Background())
+	if !errors.Is(err, arbiter.ErrNoFleet) {
+		t.Fatalf("a 404 must be ErrNoFleet, got %v", err)
+	}
+
+	broken := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer broken.Close()
+	_, err = arbiter.NewFleet(broken.URL, "s", 1, clock.NewFake()).Fleet(context.Background())
+	if err == nil || errors.Is(err, arbiter.ErrNoFleet) {
+		t.Fatalf("a 500 is a failure but not an absent endpoint, got %v", err)
+	}
+}
+
+// A refused connection is an error and never a fabricated, empty inventory:
+// "I could not read the fleet" must not be reportable as "the fleet is
+// empty".
+func TestFleetTransportFailureIsAnErrorNotAnEmptyFleet(t *testing.T) {
+	reply, err := arbiter.NewFleet("http://192.0.2.1:1", "s", 0.05, clock.NewFake()).
+		Fleet(context.Background())
+	if err == nil {
+		t.Fatal("a refused connection must be an error")
+	}
+	if reply.Services != nil || reply.Hosts != nil {
+		t.Fatalf("a failed read must fabricate nothing, got %+v", reply)
 	}
 }

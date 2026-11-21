@@ -136,6 +136,17 @@ type arbiterAPI interface {
 	Batch(ttl float64, fingerprint string, ops map[string]arbiter.Op) arbiter.Reply
 }
 
+// FleetReader is the optional fleet capability, and it is deliberately NOT
+// part of arbiterAPI. dynarbiter satisfies arbiterAPI structurally with Batch
+// alone; adding Fleet to that interface would break it, and every dynamo host
+// with it. So a backend that can answer GET /fleet offers this separately, and
+// a backend that cannot — dynamo — leaves the supervisor's fleet field nil.
+// nil is not an error: it is "this backend has no fleet view", which local
+// mode reports as a note rather than a failure (D8).
+type FleetReader interface {
+	Fleet(ctx context.Context) (arbiter.FleetReply, error)
+}
+
 // docker is the slice of dockerapi.Client the loop and the executors need.
 type docker interface {
 	Inspect(name string) (dockerapi.ContainerState, error)
@@ -207,6 +218,11 @@ type Options struct {
 	Probe      prober
 	DiskFreeGB func(path string) (float64, error)
 	Logger     *slog.Logger
+	// Fleet is the optional read capability for the local `conch fleet` view.
+	// It is separate from Arbiter on purpose (see FleetReader): nil is a
+	// backend without a fleet endpoint, and local mode says so rather than
+	// failing. It is only ever used by the admin goroutine, never the loop.
+	Fleet FleetReader
 	// Updates is the version source for the periodic update check
 	// (config.Updates). Nil with an enabled config builds the default Docker
 	// Hub source; nil or non-nil with a disabled config means no checks run.
@@ -301,6 +317,7 @@ type Supervisor struct {
 	dryRun      bool
 
 	arb   arbiterAPI
+	fleet FleetReader
 	dk    docker
 	hooks hookRunner
 	clk   clock.Clock
@@ -421,6 +438,7 @@ func New(o Options) (*Supervisor, error) {
 		instance:      o.Instance,
 		dryRun:        o.DryRun,
 		arb:           o.Arbiter,
+		fleet:         o.Fleet,
 		dk:            o.Docker,
 		hooks:         o.Hooks,
 		clk:           o.Clock,
@@ -1922,6 +1940,92 @@ func (s *Supervisor) Status() map[string]any {
 		}
 		out[key] = entry
 	}
+	return out
+}
+
+// FleetView is the local `conch fleet` answer: this host's own view, merged
+// with the arbiter's fleet snapshot when one is reachable. It is deliberately
+// not the arbiter's FleetReply: local mode exists to show BOTH what this host
+// supervises and what the arbiter believes, so a lease no host's intent list
+// accounts for — the post-rename drift the naming work creates — is visible
+// rather than hidden behind a merge that trusts one side.
+type FleetView struct {
+	// Host is this host's configured name, and SupervisedHere its service
+	// keys: the local truth, which does not depend on the arbiter being up.
+	Host           string   `json:"host"`
+	SupervisedHere []string `json:"supervised_here"`
+	// Peers is the presence from the most recent batch, host -> seconds since
+	// last seen. It is what the arbiter last told us, so it is stale by up to
+	// one interval, and empty before the first batch.
+	Peers map[string]float64 `json:"peers"`
+	// Arbiter is the arbiter's own snapshot, nil when this backend has no
+	// fleet endpoint (dynamo, D8) or the arbiter could not be reached. A nil
+	// here is never a failed command: the local view stands on its own, with
+	// Note explaining what is missing.
+	Arbiter *arbiter.FleetReply `json:"arbiter,omitempty"`
+	// Unsupervised names every lease the arbiter reports that no host's stated
+	// intent accounts for — including this host's own config. It is the drift
+	// probe, computed only when Arbiter is non-nil.
+	Unsupervised []string `json:"unsupervised,omitempty"`
+	// Note says why Arbiter is nil, in the operator's words, when it is.
+	Note string `json:"note,omitempty"`
+}
+
+// Fleet assembles this host's local view for `conch fleet --socket`. It takes
+// the same snapshot Status does, briefly, then makes the one arbiter read
+// OUTSIDE the lock: the whole point of local mode is that it works while the
+// arbiter is down, and a network call under s.mu would let a slow or dead
+// arbiter stall the supervision loop. A missing capability or an unreachable
+// arbiter is a note, not an error — the local view is still an answer.
+func (s *Supervisor) Fleet(ctx context.Context) FleetView {
+	view := FleetView{
+		Host:           s.cfg.Host,
+		SupervisedHere: append([]string(nil), s.order...),
+	}
+	s.mu.Lock()
+	view.Peers = make(map[string]float64, len(s.lastPeers))
+	for host, lastSeen := range s.lastPeers {
+		view.Peers[host] = lastSeen
+	}
+	s.mu.Unlock()
+
+	if s.fleet == nil {
+		view.Note = "this backend has no fleet view"
+		return view
+	}
+	reply, err := s.fleet.Fleet(ctx)
+	if err != nil {
+		view.Note = "the arbiter is unreachable: showing this host's view only"
+		return view
+	}
+	view.Arbiter = &reply
+	view.Unsupervised = unsupervisedLeases(view, reply)
+	return view
+}
+
+// unsupervisedLeases is the drift probe: a lease the arbiter reports that no
+// host's stated intent accounts for. A key is supervised if any host's last
+// batch listed it in hosts[].services, or — covering a host whose presence has
+// lapsed and so is omitted from the render — if it is in THIS host's config.
+// A key none of those name is a lease with no owner to serve it, which is
+// exactly what a service rename leaves behind.
+func unsupervisedLeases(view FleetView, reply arbiter.FleetReply) []string {
+	supervised := make(map[string]bool, len(view.SupervisedHere))
+	for _, key := range view.SupervisedHere {
+		supervised[key] = true
+	}
+	for _, host := range reply.Hosts {
+		for _, key := range host.Services {
+			supervised[key] = true
+		}
+	}
+	var out []string
+	for key := range reply.Services {
+		if !supervised[key] {
+			out = append(out, key)
+		}
+	}
+	sort.Strings(out)
 	return out
 }
 

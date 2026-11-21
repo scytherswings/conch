@@ -402,6 +402,26 @@ type fakeArbiter struct {
 	fingerprints map[string]string
 	peers        map[string]float64
 	onBatch      func(check int)
+	// fleetReply and fleetErr script the optional Fleet capability (Task 3).
+	// This fake satisfies FleetReader as well as arbiterAPI, so a test can
+	// hand the SAME fake to Options.Fleet and observe what Fleet merges.
+	fleetReply *arbiter.FleetReply
+	fleetErr   error
+}
+
+// Fleet is the optional read capability the local fleet view uses. It is a
+// separate method from Batch on purpose (see FleetReader): in production only
+// the cloudflare client has it, and dynamo deliberately does not.
+func (a *fakeArbiter) Fleet(ctx context.Context) (arbiter.FleetReply, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.fleetErr != nil {
+		return arbiter.FleetReply{}, a.fleetErr
+	}
+	if a.fleetReply == nil {
+		return arbiter.FleetReply{}, nil
+	}
+	return *a.fleetReply, nil
 }
 
 func (a *fakeArbiter) Batch(ttl float64, fingerprint string, ops map[string]arbiter.Op) arbiter.Reply {
@@ -3353,6 +3373,90 @@ func TestStatusReportsPeerPresence(t *testing.T) {
 	peers["host-b"] = 999
 	if again, _ := h.sup.Status()["peers"].(map[string]float64); again["host-b"] != 2.5 {
 		t.Fatalf("status handed out its own live map, got %v", again)
+	}
+}
+
+// TestFleetMergesTheArbiterAndFlagsDrift is the local view's whole point: this
+// host's config plus the arbiter's snapshot, with a lease no host accounts for
+// named as drift. The orphan key is what a service rename leaves behind — a
+// lease still held and renewed, served by nothing the fleet's configs know of.
+func TestFleetMergesTheArbiterAndFlagsDrift(t *testing.T) {
+	rig := newRig(t, testConfig("web", "blog"))
+	rig.build(func(o *Options) { o.Fleet = rig.arb })
+	h := rig
+
+	h.arb.reply = freeThenGrant(0)
+	h.arb.setPeers(map[string]float64{"host-b": 2.5})
+	h.check() // one batch, so lastPeers is populated
+
+	holder := "host-b"
+	h.arb.fleetReply = &arbiter.FleetReply{
+		GeneratedAt: 7,
+		Services: map[string]arbiter.FleetService{
+			"web":    {Holder: &holder, Serving: true, Epoch: 2},
+			"blog":   {Epoch: 1},
+			"orphan": {Holder: &holder, Serving: true, Epoch: 9},
+		},
+		Hosts: map[string]arbiter.FleetHost{
+			"host-a": {Services: []string{"web", "blog"}},
+		},
+	}
+
+	view := h.sup.Fleet(context.Background())
+	if view.Host != "host-a" {
+		t.Fatalf("host: got %q", view.Host)
+	}
+	if !reflect.DeepEqual(view.SupervisedHere, []string{"blog", "web"}) {
+		t.Fatalf("supervised_here must be this host's keys, sorted: got %v", view.SupervisedHere)
+	}
+	if view.Peers["host-b"] != 2.5 {
+		t.Fatalf("peers must ride the local view: got %v", view.Peers)
+	}
+	if view.Arbiter == nil || view.Arbiter.GeneratedAt != 7 {
+		t.Fatalf("the arbiter snapshot must be merged in: %+v", view.Arbiter)
+	}
+	if !reflect.DeepEqual(view.Unsupervised, []string{"orphan"}) {
+		t.Fatalf("a lease no host supervises is drift: got %v", view.Unsupervised)
+	}
+	if view.Note != "" {
+		t.Fatalf("a reachable arbiter needs no note, got %q", view.Note)
+	}
+}
+
+// A backend with no fleet endpoint (dynamo, D8) is a nil capability, and that
+// is a note in the local view — never an error and never an empty success.
+func TestFleetWithNoCapabilityIsANote(t *testing.T) {
+	h := newHarness(t, testConfig("web"), nil) // Options.Fleet left nil
+	view := h.sup.Fleet(context.Background())
+	if view.Arbiter != nil {
+		t.Fatalf("a backend without /fleet cannot have a snapshot: %+v", view.Arbiter)
+	}
+	if view.Note == "" || !strings.Contains(view.Note, "no fleet view") {
+		t.Fatalf("the note must say why there is no snapshot, got %q", view.Note)
+	}
+	if !reflect.DeepEqual(view.SupervisedHere, []string{"web"}) {
+		t.Fatalf("the local half must survive regardless: got %v", view.SupervisedHere)
+	}
+}
+
+// An unreachable arbiter (the on_loss: freeze incident) keeps the local view
+// and adds a note: the read still answers, which is the graceful degradation
+// the plan's counter-argument promises.
+func TestFleetWithUnreachableArbiterKeepsTheLocalView(t *testing.T) {
+	rig := newRig(t, testConfig("web"))
+	rig.build(func(o *Options) { o.Fleet = rig.arb })
+	h := rig
+	h.arb.fleetErr = errors.New("connection refused")
+
+	view := h.sup.Fleet(context.Background())
+	if view.Arbiter != nil {
+		t.Fatalf("an unreachable arbiter has no snapshot: %+v", view.Arbiter)
+	}
+	if !strings.Contains(view.Note, "unreachable") {
+		t.Fatalf("the note must say the arbiter was unreachable, got %q", view.Note)
+	}
+	if !reflect.DeepEqual(view.SupervisedHere, []string{"web"}) {
+		t.Fatalf("the local half must survive an arbiter outage: got %v", view.SupervisedHere)
 	}
 }
 

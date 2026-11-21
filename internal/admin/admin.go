@@ -60,6 +60,7 @@ const maxRequestBody = 64 << 10
 // guarantee that sketch was actually asking for, and it cannot drift.
 type Backend interface {
 	Status() map[string]any
+	Fleet(ctx context.Context) supervisor.FleetView
 	Evacuate(services []string, all, hold, force bool) (<-chan supervisor.EvacEvent, error)
 	Reclaim(service string) error
 }
@@ -152,6 +153,16 @@ func routes(b Backend) http.Handler {
 
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, b.Status())
+	})
+
+	mux.HandleFunc("GET /fleet", func(w http.ResponseWriter, r *http.Request) {
+		// The supervisor's local view: this host's services plus (when it can
+		// reach one) the arbiter's snapshot. The read is off the loop, and a
+		// missing capability or an unreachable arbiter is a note inside the
+		// view, not an error — local mode is meant to work while the arbiter
+		// is down (spec §9). The context passed in is the request's, so a
+		// client that walks away cancels the arbiter read behind it.
+		writeJSON(w, http.StatusOK, b.Fleet(r.Context()))
 	})
 
 	mux.HandleFunc("POST /evacuate", func(w http.ResponseWriter, r *http.Request) {
@@ -290,6 +301,29 @@ func (c CLI) Status() (string, error) {
 		return string(raw), nil // valid or not, the operator gets what conch said
 	}
 	return pretty.String(), nil
+}
+
+// Fleet returns the running supervisor's local fleet view: this host's
+// services, its last-seen peers, and the arbiter's snapshot when the
+// supervisor could reach one. The supervisor always answers (an unreachable
+// arbiter is a note in the view), so the only error here is the one every verb
+// shares: no supervisor behind this socket.
+func (c CLI) Fleet() (supervisor.FleetView, error) {
+	resp, err := c.client().Get("http://conch/fleet")
+	if err != nil {
+		return supervisor.FleetView{}, notAnswering(c.Socket, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		return supervisor.FleetView{}, fmt.Errorf(
+			"the supervisor answered %s to a fleet request: %s", resp.Status, strings.TrimSpace(string(raw)))
+	}
+	var view supervisor.FleetView
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&view); err != nil {
+		return supervisor.FleetView{}, fmt.Errorf("fleet: unreadable answer: %w", err)
+	}
+	return view, nil
 }
 
 // Evacuate requests an evacuation and follows it to its verdict. ok is the

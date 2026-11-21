@@ -2,14 +2,21 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/scytherswings/conch/internal/arbiter"
+	"github.com/scytherswings/conch/internal/supervisor"
 )
 
 // minimalYAML is a config that validates clean, in the same shape as
@@ -280,5 +287,231 @@ func TestADryRunIsNeverQuieterThanInfo(t *testing.T) {
 	}
 	if !logger.Enabled(context.Background(), slog.LevelDebug) {
 		t.Fatalf("--dry-run must not clamp a level the operator raised")
+	}
+}
+
+// fleetJSON is the frozen GET /fleet shape (Task 1) as the client sees it:
+// one live holder, one free key, and two hosts. Every render test reads the
+// same fixture so a change in one is a change in all.
+const fleetJSON = `{"generatedAt":1795152221297,
+  "services":{
+    "web":{"holder":"host-a","serving":true,"epoch":12,"expiresIn":8.4,"evacuatedBy":null,"barred":false,"conflict":null},
+    "blog":{"holder":null,"serving":false,"epoch":3,"expiresIn":null,"evacuatedBy":null,"barred":false,"conflict":null}},
+  "hosts":{
+    "host-a":{"lastSeenAgo":1.2,"fingerprint":"ab12","services":["web","blog"]},
+    "host-b":{"lastSeenAgo":9.9,"fingerprint":null,"services":[]}}}`
+
+// fleetServer serves fleetJSON on /fleet and 405s anything else, so a client
+// that got the path wrong cannot pass by accident.
+func fleetServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/fleet" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		io.WriteString(w, fleetJSON)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestFleetRemoteRendersServicesThenHosts pins the human form: every service
+// as key → holder (or free) → serving → flags, then every host with its
+// presence and what it says it supervises. Remote mode reads it with nothing
+// but a URL and a secret — no config file, no socket, no supervisor.
+func TestFleetRemoteRendersServicesThenHosts(t *testing.T) {
+	srv := fleetServer(t)
+	t.Setenv("CONCH_FLEET_TEST_SECRET", "s3cr3t")
+
+	stdout, stderr, code := captureOutput(t, func() int {
+		return run([]string{"fleet", "--arbiter", srv.URL, "--secret-env", "CONCH_FLEET_TEST_SECRET"})
+	})
+
+	if code != 0 {
+		t.Fatalf("want exit 0, got %d (stderr=%q)", code, stderr)
+	}
+	for _, want := range []string{
+		"services", "web", "host-a", "serving", "blog", "free", "standby",
+		"hosts", "1.2", "ab12", "supervises",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("the human summary is missing %q:\n%s", want, stdout)
+		}
+	}
+	// Services are listed before hosts: the question is "who serves what",
+	// and the hosts are supporting detail.
+	if strings.Index(stdout, "services") > strings.Index(stdout, "hosts") {
+		t.Fatalf("services must come first:\n%s", stdout)
+	}
+}
+
+// TestFleetRemoteJSONIsMachineReadable pins --json: the reply comes back as
+// parseable JSON carrying the same fields, for an agent or a script.
+func TestFleetRemoteJSONIsMachineReadable(t *testing.T) {
+	srv := fleetServer(t)
+	t.Setenv("CONCH_FLEET_TEST_SECRET", "s3cr3t")
+
+	stdout, stderr, code := captureOutput(t, func() int {
+		return run([]string{"fleet", "--arbiter", srv.URL, "--secret-env", "CONCH_FLEET_TEST_SECRET", "--json"})
+	})
+	if code != 0 {
+		t.Fatalf("want exit 0, got %d (stderr=%q)", code, stderr)
+	}
+
+	var got struct {
+		GeneratedAt int64 `json:"generatedAt"`
+		Services    map[string]struct {
+			Holder  *string `json:"holder"`
+			Serving bool    `json:"serving"`
+		} `json:"services"`
+		Hosts map[string]struct {
+			LastSeenAgo float64 `json:"lastSeenAgo"`
+		} `json:"hosts"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+		t.Fatalf("--json must emit JSON, got %q: %v", stdout, err)
+	}
+	if got.GeneratedAt != 1795152221297 {
+		t.Fatalf("generatedAt did not survive: %d", got.GeneratedAt)
+	}
+	if got.Services["web"].Holder == nil || *got.Services["web"].Holder != "host-a" || !got.Services["web"].Serving {
+		t.Fatalf("web did not survive: %+v", got.Services["web"])
+	}
+	if got.Services["blog"].Holder != nil {
+		t.Fatalf("a free lease must stay null, got %q", *got.Services["blog"].Holder)
+	}
+	if got.Hosts["host-b"].LastSeenAgo != 9.9 {
+		t.Fatalf("host-b did not survive: %+v", got.Hosts["host-b"])
+	}
+}
+
+// An arbiter without the route is the upgrade case (and the dynamo backend,
+// D8): the operator gets the one message that tells them what to do, and a
+// non-zero exit.
+func TestFleetTooOldReportsUpgrade(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("CONCH_FLEET_TEST_SECRET", "s3cr3t")
+
+	stdout, stderr, code := captureOutput(t, func() int {
+		return run([]string{"fleet", "--arbiter", srv.URL, "--secret-env", "CONCH_FLEET_TEST_SECRET"})
+	})
+
+	if code == 0 {
+		t.Fatalf("an arbiter without /fleet must not exit 0 (stdout=%q)", stdout)
+	}
+	for _, want := range []string{"/fleet", "upgrade"} {
+		if !strings.Contains(stderr, want) {
+			t.Fatalf("the too-old message must name %q, got %q", want, stderr)
+		}
+	}
+}
+
+// A refused connection is a clear error, a non-zero exit, and NO partial
+// table: an empty fleet must never be printed for a read that did not happen.
+func TestFleetRefusedConnectionPrintsNoTable(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	ln.Close() // nothing is listening now: the dial is refused
+	t.Setenv("CONCH_FLEET_TEST_SECRET", "s3cr3t")
+
+	stdout, stderr, code := captureOutput(t, func() int {
+		return run([]string{"fleet", "--arbiter", "http://" + addr, "--secret-env", "CONCH_FLEET_TEST_SECRET"})
+	})
+
+	if code == 0 {
+		t.Fatal("a refused connection must be a non-zero exit")
+	}
+	if strings.TrimSpace(stdout) != "" {
+		t.Fatalf("a failed read must print no table, got %q", stdout)
+	}
+	if !strings.Contains(stderr, "fleet:") {
+		t.Fatalf("the failure must name the command, got %q", stderr)
+	}
+}
+
+// --arbiter is the one required input in remote mode; its absence is a usage
+// error (2), caught before any secret is read or any connection made.
+func TestFleetRequiresAnArbiterURL(t *testing.T) {
+	stdout, stderr, code := captureOutput(t, func() int {
+		return run([]string{"fleet"})
+	})
+	if code != 2 {
+		t.Fatalf("want exit 2, got %d (stdout=%q)", code, stdout)
+	}
+	if !strings.Contains(stderr, "--arbiter") {
+		t.Fatalf("the refusal must name the missing flag, got %q", stderr)
+	}
+}
+
+// The secret rules are the config's own: with neither secret_env nor
+// secret_file, fleet refuses with readSecret's message rather than sending an
+// empty credential.
+func TestFleetRefusesWithoutASecret(t *testing.T) {
+	srv := fleetServer(t)
+	stdout, stderr, code := captureOutput(t, func() int {
+		return run([]string{"fleet", "--arbiter", srv.URL})
+	})
+	if code != 2 {
+		t.Fatalf("want exit 2, got %d (stdout=%q)", code, stdout)
+	}
+	if !strings.Contains(stderr, "secret") {
+		t.Fatalf("the refusal must explain the missing secret, got %q", stderr)
+	}
+}
+
+// TestFleetLocalRendersHostThenArbiter pins the local render: this host's name,
+// what it supervises, its peers, then the arbiter's snapshot, then the drift
+// probe and any note. It reuses the remote renderer for the arbiter half, so
+// the two modes agree on how a fleet reads.
+func TestFleetLocalRendersHostThenArbiter(t *testing.T) {
+	holder := "host-a"
+	view := supervisor.FleetView{
+		Host:           "host-a",
+		SupervisedHere: []string{"blog", "web"},
+		Peers:          map[string]float64{"host-b": 2.5},
+		Arbiter: &arbiter.FleetReply{
+			GeneratedAt: 1,
+			Services:    map[string]arbiter.FleetService{"web": {Holder: &holder, Serving: true, Epoch: 1}},
+			Hosts:       map[string]arbiter.FleetHost{"host-a": {LastSeenAgo: 0.4, Services: []string{"web"}}},
+		},
+		Unsupervised: []string{"orphan"},
+		Note:         "the arbiter is unreachable: showing this host's view only",
+	}
+
+	var buf strings.Builder
+	renderFleetLocal(&buf, view)
+	out := buf.String()
+	for _, want := range []string{
+		"host: host-a", "supervised here", "blog", "web", "peers", "host-b", "2.5",
+		"services", "serving", "hosts", "drift", "orphan", "note:",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("the local summary is missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Index(out, "host: host-a") > strings.Index(out, "services") {
+		t.Fatalf("this host's own view must come first:\n%s", out)
+	}
+}
+
+// --socket with no supervisor behind it is the one local-mode failure: the
+// admin client's own "conch is not answering" message, exit non-zero.
+func TestFleetSocketModeWithNoSupervisorFails(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "missing.sock")
+	stdout, stderr, code := captureOutput(t, func() int {
+		return run([]string{"fleet", "--socket", socket})
+	})
+	if code == 0 {
+		t.Fatalf("a missing supervisor must not exit 0 (stdout=%q)", stdout)
+	}
+	if !strings.Contains(stderr, "not answering") {
+		t.Fatalf("the failure must say conch is not answering, got %q", stderr)
 	}
 }
