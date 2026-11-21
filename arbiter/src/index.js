@@ -34,6 +34,20 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === "/health") return json({ ok: true, service: "conch-arbiter" });
+
+    // GET /fleet (D1): a pure read of the arbiter's own state. Auth precedes the
+    // DO call so an unauthenticated hit never wakes the object (F13); the same
+    // fixed error shapes as /batch keep a URL holder from learning which secret
+    // is unset. GET only, and no body is read.
+    if (url.pathname === "/fleet") {
+      if (request.method !== "GET") return json({ error: "method_not_allowed" }, 405);
+      if (!env.CONCH_AUTH_SECRET) return json({ error: "server_misconfigured" }, 500);
+      if (!authorized(request, env)) return json({ error: "unauthorized" }, 401);
+      const stub = env.LEASE.get(env.LEASE.idFromName(SINGLETON));
+      const res = await stub.fetch("https://lease.invalid/fleet");
+      return json(await res.json(), res.status);
+    }
+
     if (url.pathname !== "/batch") return json({ error: "not_found" }, 404);
     if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
 

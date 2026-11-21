@@ -172,7 +172,14 @@ export class LeaseDO {
         if (typeof img === "string" && img) { images[key] = img.slice(0, 512); n++; }
       }
     }
-    this.hosts[host] = { lastSeen: now, fingerprint: body.fingerprint ?? null, images };
+    // The intent map (D2): the valid keys this host just sent, recorded on the
+    // existing single write so a read-only inventory can answer "who claims what"
+    // without a second write and without a client change. The filter is the op
+    // loop's own — a key it would drop has no response to hang, so it is not
+    // intent either. Both hosts in a homogeneous fleet list the same keys by
+    // design; this is a central view, not a per-host diff.
+    const keys = Object.keys(body.services ?? {}).filter((key) => key && key.length <= 128);
+    this.hosts[host] = { lastSeen: now, fingerprint: body.fingerprint ?? null, images, keys };
     for (const [h, rec] of Object.entries(this.hosts)) {
       if (now - rec.lastSeen > PRESENCE_TTL_MS) delete this.hosts[h];
     }
@@ -241,7 +248,54 @@ export class LeaseDO {
     return { services, peers, fingerprints, hostImages };
   }
 
+  /**
+   * A read-only render of the whole fleet for GET /fleet (D3/F13). It never
+   * writes: lazy expiry and the presence TTL are applied to a shallow copy of
+   * each record for display only, so a lapsed holder renders null while the
+   * stored state is untouched until the next batch's own expireIfDue. Fields
+   * are the minimum F13 allows — no `instance`, no per-host `images`, no raw
+   * booking fields — and an unknown key simply has no record to show.
+   */
+  fleetSnapshot(now) {
+    const services = {};
+    for (const [key, l] of Object.entries(this.leases)) {
+      const copy = { ...l };
+      this.expireIfDue(now, copy);
+      const held = copy.holder !== null;
+      services[key] = {
+        holder: copy.holder,
+        serving: held && copy.serving === true,
+        epoch: copy.epoch,
+        expiresIn: held && copy.expiresAt !== null
+          ? Math.max(0, (copy.expiresAt - now) / 1000) : null,
+        evacuatedBy: copy.evacuatedBy,
+        barred: copy.evacuatedBy !== null,
+        conflict: copy.conflictUntil !== null && now < copy.conflictUntil
+          ? copy.conflictHost : null,
+      };
+    }
+    const hosts = {};
+    for (const [h, rec] of Object.entries(this.hosts)) {
+      // Omit a host the next batch would delete rather than report it live:
+      // the two surfaces must agree on who is present.
+      if (now - rec.lastSeen > PRESENCE_TTL_MS) continue;
+      hosts[h] = {
+        lastSeenAgo: Math.max(0, (now - rec.lastSeen) / 1000),
+        fingerprint: rec.fingerprint ?? null,
+        services: rec.keys ?? [],
+      };
+    }
+    return { generatedAt: now, services, hosts };
+  }
+
   async fetch(request) {
+    // Branch on the path before touching the body: /fleet is a pure read and
+    // must never reach save(). The Worker never posts a body here.
+    if (new URL(request.url).pathname === "/fleet") {
+      const snapshot = this.fleetSnapshot(Date.now());
+      return new Response(JSON.stringify(snapshot), {
+        headers: { "content-type": "application/json" } });
+    }
     const body = await request.json();
     const now = Date.now();
     const result = this.batch(now, body);
