@@ -60,8 +60,9 @@ here observes conch for signs of life.
 **`--dry-run` must not perform actions.** It logs every decision and the exact actions it
 would take, executes none, and sends the arbiter only `read` ops — never `renew`
 or `release`, enforced by a test — so a dry run pointed at a production arbiter
-cannot claim a lease out from under the real active host. Any new action must
-honour both halves of that.
+cannot claim a lease out from under the real active host. It is still a batch, so
+the arbiter records the host's presence: the guarantee is no claim, not no write.
+Any new action must honour both halves of that.
 
 **Services are configuration, not code.** Adding a service or a hostname is an
 edit to a config file. A PR that adds a code path keyed on a particular

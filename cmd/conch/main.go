@@ -37,11 +37,13 @@ import (
 // installed on hosts.
 const defaultSocket = "/run/conch/admin.sock"
 
-// dryRunBanner is spec §10's exact wording for a dry run: it logs every
-// decision and the actions it would take, executes none, and sends the
-// arbiter only reads — never renew or release — so a dry run pointed at a
-// live arbiter cannot claim a lease out from under the real active host.
-const dryRunBanner = "DRY-RUN: decisions logged, nothing executed, arbiter reads only"
+// dryRunBanner is spec §10's wording for a dry run: it logs every decision and
+// the actions it would take, executes none, and sends the arbiter only `read`
+// lease ops — never renew or release — so a dry run pointed at a live arbiter
+// cannot claim a lease out from under the real active host. "Lease ops" is
+// load-bearing: every batch still registers the host's presence, so a dry run is
+// a no-claim promise, not a no-write one (arbiter/src/lease.js batch()).
+const dryRunBanner = "DRY-RUN: decisions logged, nothing executed, arbiter lease ops are reads only (presence still recorded)"
 
 // defaultLogLevel is what a host runs at: lifecycle, and anything degraded or
 // broken. The per-check decision lines are Debug, so a fleet that checks every
@@ -148,7 +150,7 @@ type arbiterBackend interface {
 func cmdRun(args []string) int {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	cfgPath := fs.String("config", "/etc/conch/conch.yml", "path to the conch YAML config")
-	dryRun := fs.Bool("dry-run", false, "log every decision and the actions it would take; execute none; arbiter reads only")
+	dryRun := fs.Bool("dry-run", false, "log every decision and the actions it would take; execute none; arbiter lease ops are reads only")
 	socketPath := fs.String("socket", defaultSocket, "unix socket for the admin surface")
 	logLevel := fs.String("log-level", defaultLogLevel,
 		"debug|info|warn|error; debug adds every per-check decision, one line per service per check")

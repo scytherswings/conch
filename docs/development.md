@@ -107,7 +107,8 @@ The full list is in [CONTRIBUTING.md](../CONTRIBUTING.md). The short version:
 - **Every outbound call has a hard deadline.** A hung supervisor is a missing
   timeout on the arbiter client or the Docker socket client.
 - **`--dry-run` does not perform actions.** It logs every decision, executes none, and sends
-  the arbiter only `read` operations. A test enforces that.
+  the arbiter only `read` operations. A test enforces that. The arbiter still
+  records the host's presence; the guarantee is no claim, not no write.
 - **Services are configuration, not code.** A code path keyed on a particular
   application's name is going the wrong way.
 - **No real infrastructure in the repo.** Use generic placeholders. Keep

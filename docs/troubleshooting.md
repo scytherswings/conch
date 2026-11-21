@@ -130,8 +130,9 @@ lease.
 ## Debugging safely
 
 `--dry-run` logs every decision and performs none of the actions. It sends the
-arbiter only reads, so it cannot claim a lease from a live host. Use it to see
-what conch would do without touching traffic.
+arbiter only read lease ops, so it cannot claim a lease from a live host (the
+arbiter still records the host's presence). Use it to see what conch would do
+without touching traffic.
 
 ```sh
 CONCH_AUTH_SECRET=... conch run --config ./conch.yml --dry-run --socket ./admin.sock

@@ -97,7 +97,8 @@ passes `validate` is the only config conch will run.
 ## 4. Dry-run before you touch traffic
 
 A dry run logs every decision and performs none of the actions. It sends the
-arbiter only `read` operations, so it cannot claim a lease from a live host.
+arbiter only read lease ops, so it cannot claim a lease from a live host (the
+arbiter still records the host's presence).
 
 ```sh
 CONCH_AUTH_SECRET=... ./conch run --config ./conch.yml --dry-run --socket ./admin.sock

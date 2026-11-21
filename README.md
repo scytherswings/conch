@@ -82,7 +82,8 @@ The normal path is Kamal. The full runbook is in
    That means conch has not claimed anything.
 
 Before booting for real, run the binary with `--dry-run` on a host. It logs every
-decision, performs no actions, and sends the arbiter only reads. See
+decision, performs no actions, and sends the arbiter only read lease ops — so it
+never claims a lease (the arbiter still records the host's presence). See
 [`docs/quickstart.md`](docs/quickstart.md) for the manual path and the dry run.
 
 Prebuilt multi-arch images are published as `ghcr.io/scytherswings/conch` (pin a
