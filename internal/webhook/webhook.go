@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"sync/atomic"
 	"time"
 
@@ -141,6 +142,22 @@ func (n *Notifier) Run(ctx context.Context) {
 	}
 }
 
+// redactURL strips a webhook URL down to scheme://host for logging. A webhook
+// URL "may contain credentials" (docs/security.md) — Slack, Discord and Teams
+// receivers all embed a bearer token in the path — so logging it verbatim on a
+// delivery failure would write that secret to stdout, into `docker logs` and
+// every log store downstream. The scheme and host are kept because they are
+// the part an operator actually debugs with; the path and query, which carry
+// the secret, are dropped. A URL that will not parse is replaced by a fixed
+// label rather than echoed, so even a malformed value cannot leak.
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return "<webhook url>"
+	}
+	return u.Scheme + "://" + u.Host
+}
+
 // deliver makes exactly one attempt. A failure — building the request,
 // reaching the receiver, or a non-2xx response — is logged and dropped:
 // spec §11 is explicit that a failed delivery is never retried into a
@@ -155,12 +172,12 @@ func (n *Notifier) deliver(ctx context.Context, p post) {
 	body, err := json.Marshal(p.payload)
 	if err != nil {
 		n.log.Error("webhook payload could not be marshalled: the event is lost, and this is a conch bug",
-			"url", p.url, "error", err)
+			"url", redactURL(p.url), "error", err)
 		return
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.url, bytes.NewReader(body))
 	if err != nil {
-		n.log.Error("webhook request could not be built: check this url in the config", "url", p.url, "error", err)
+		n.log.Error("webhook request could not be built: check this url in the config", "url", redactURL(p.url), "error", err)
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -168,7 +185,7 @@ func (n *Notifier) deliver(ctx context.Context, p post) {
 	resp, err := n.client.Do(req)
 	if err != nil {
 		n.failed(p.kind, "webhook delivery failed: the event is dropped, never retried; check this url",
-			"url", p.url, "error", err)
+			"url", redactURL(p.url), "error", err)
 		return
 	}
 	defer resp.Body.Close()
@@ -176,7 +193,7 @@ func (n *Notifier) deliver(ctx context.Context, p post) {
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		n.failed(p.kind, "the webhook receiver rejected the event: check this url's own logs",
-			"url", p.url, "status", resp.StatusCode)
+			"url", redactURL(p.url), "status", resp.StatusCode)
 		return
 	}
 	// Only a 2xx ends a streak. A receiver answering 500 is as down, from
@@ -203,5 +220,5 @@ func (n *Notifier) succeeded(kind, url string) {
 		return
 	}
 	delete(n.failing, kind)
-	n.log.Info("webhook delivery is working again", "kind", kind, "url", url)
+	n.log.Info("webhook delivery is working again", "kind", kind, "url", redactURL(url))
 }

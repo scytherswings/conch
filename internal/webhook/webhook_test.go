@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -197,6 +198,26 @@ func (h *recordingHandler) count(level slog.Level, kind string) int {
 	return n
 }
 
+// messages flattens every record — its message and every attribute — into one
+// string, for a test that asserts a value does NOT appear anywhere in the log.
+func (h *recordingHandler) messages() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var b strings.Builder
+	for _, r := range h.records {
+		b.WriteString(r.Message)
+		r.Attrs(func(a slog.Attr) bool {
+			b.WriteString(" ")
+			b.WriteString(a.Key)
+			b.WriteString("=")
+			b.WriteString(a.Value.String())
+			return true
+		})
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
 // capture points a notifier's logger at a recording handler. New hardcodes
 // slog.Default(), and this test lives in the same package, so the field is
 // assigned directly rather than growing an option nothing in production would
@@ -335,5 +356,58 @@ func TestFingerprintMismatchRoutesToAlertURL(t *testing.T) {
 	case <-received:
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for fingerprint_mismatch to reach the alert URL")
+	}
+}
+
+// A webhook URL may embed a bearer secret in its path — Slack, Discord and
+// Teams receivers all do — so no log line, on a failed delivery or on the
+// recovery from one, may echo it. The host stays, because that is what an
+// operator debugs with; the path does not.
+func TestWebhookURLsAreRedactedInLogs(t *testing.T) {
+	// A receiver path shaped like a Slack incoming-webhook token.
+	const secretPath = "/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX"
+
+	status := atomic.Int64{}
+	status.Store(http.StatusInternalServerError)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(int(status.Load()))
+	}))
+	defer srv.Close()
+
+	sentinel := make(chan struct{}, 1)
+	sentinelSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		sentinel <- struct{}{}
+	}))
+	defer sentinelSrv.Close()
+
+	n := New(config.WebhookConfig{Demote: srv.URL + secretPath, Reclaim: sentinelSrv.URL}, clock.NewFake())
+	handler := capture(n)
+	run(n)
+
+	// The worker is single and serial, so once the sentinel's request arrives,
+	// the demote delivery before it — its log line included — has completed.
+	drain := func(what string) {
+		t.Helper()
+		n.Event("reclaim", map[string]any{"sentinel": what})
+		select {
+		case <-sentinel:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out draining the queue after %s", what)
+		}
+	}
+
+	n.Event("demote", map[string]any{"n": 1}) // a failure: Warn path
+	drain("the failure")
+	status.Store(http.StatusOK)
+	n.Event("demote", map[string]any{"n": 2}) // the recovery: Info path
+	drain("the recovery")
+
+	joined := handler.messages()
+	if strings.Contains(joined, secretPath) {
+		t.Fatalf("a webhook secret path reached the log:\n%s", joined)
+	}
+	if !strings.Contains(joined, srv.URL) {
+		t.Fatalf("the redacted host must still be logged for debugging:\n%s", joined)
 	}
 }
