@@ -1,0 +1,173 @@
+# conch: single-service Kamal accessory quick start (spec §13)
+#
+# Paste the `accessories:` block below into your Kamal `config/deploy.yml`.
+# This wires up ONE service ("web") on ONE host, using host networking. Read
+# "Why network: host here" below before you reach for this file: it is NOT
+# the more turnkey option for a typical Kamal app fronted by kamal-proxy —
+# see conch-accessory.template.yml for that. This file exists because host
+# networking is what legalizes 127.0.0.1 health URLs and turns on the
+# connector-readiness check (spec §4) with the least moving parts, which is
+# worth having a worked example of; it costs you having to publish "web"'s
+# own health port on the host loopback, which for an app normally reached
+# only through kamal-proxy is extra plumbing, not less. It is deliberately
+# not the whole fleet either way: conch is designed and tested for two or
+# more hosts (spec §1),
+# so copy this entire block again for your second host, changing `host:` and
+# the mounted config file — AND renaming both accessory keys (`conch` and
+# `cloudflared-web` below), since a Kamal deploy.yml's `accessories:` map has
+# one entry per key: a second `conch:` block would silently overwrite the
+# first instead of adding a second host. conch-accessory.template.yml
+# already does this renaming (`conch-host-a` / `conch-host-b`) — once you
+# have two hosts, or more than one service, move to it instead of hand-
+# extending this file.
+#
+# ---------------------------------------------------------------------------
+# Why `network: host` here
+# ---------------------------------------------------------------------------
+# conch's config resolves `health.url` and `connector.ready_url` INSIDE the
+# conch container's own network namespace (spec §11, "namespace honesty").
+# Loopback addresses (127.0.0.1) only reach the right target if conch shares
+# the host's network namespace with everything else — which is exactly what
+# `network: host` does (Kamal's `network:` key is a raw passthrough to
+# `docker run --network <value>`, not a closed set of named options — `host`
+# is exactly as valid there as any other value Docker itself accepts).
+# `conch validate` refuses loopback URLs unless the config also sets
+# `host_network: true`, so the two must move together: `network: host` on
+# the accessory below, `host_network: true` in the config file it mounts.
+# (conch-accessory.template.yml takes the other option — docker-network DNS
+# names, no host networking — because it doesn't need 127.0.0.1 anywhere.)
+#
+# The same `network: host` on the cloudflared accessory is what lets conch
+# reach cloudflared's metrics port at 127.0.0.1:2000 for the connector
+# readiness check (spec §4) — without it, conch and cloudflared would each
+# have their own loopback and never see each other's ports.
+#
+# Your config/conch.yml (mounted below) needs, at minimum:
+#
+#   host: host-a
+#   host_network: true
+#   arbiter:
+#     url: https://conch-lease.example.workers.dev
+#     secret_env: CONCH_AUTH_SECRET
+#   services:
+#     - name: web
+#       container: web-web
+#       connector:
+#         container: cloudflared-web
+#         ready_url: http://127.0.0.1:2000/ready   # cloudflared's --metrics port, below
+#       health:
+#         url: http://127.0.0.1:8080/up             # the app container must publish
+#                                                     # this port on the host loopback
+#                                                     # too, e.g. by also running it
+#                                                     # with host networking — that is
+#                                                     # a property of your app's own
+#                                                     # Kamal service, not this file.
+#
+# ---------------------------------------------------------------------------
+# Restart policy — read before you add an `options:` block
+# ---------------------------------------------------------------------------
+# There is no accessory-level `restart:` key in Kamal 2.x. Kamal starts every
+# container it manages — accessories included — with `--restart
+# unless-stopped` by default, with no config needed to get it. That default
+# is exactly what conch's connector needs (spec §4): `unless-stopped` lets
+# Docker restart a connector that crashed on its own, while a connector conch
+# deliberately stopped (a STANDBY reconcile, a demotion, an evacuation) stays
+# stopped across daemon restarts and reboots.
+#
+# NEVER override this to `restart: always` via `options: { restart: always }`
+# on the cloudflared accessory. `always` resurrects a connector Docker
+# thinks "should be running" independent of why it was stopped — including
+# the one time conch stopped it on purpose because this host lost the lease.
+# That is the forbidden two-connectors-serving outcome, delivered by one
+# YAML line. Leave `options:` off entirely, as below, and the safe default
+# holds.
+# ---------------------------------------------------------------------------
+
+accessories:
+  conch:
+    service: conch                    # exact container name — `docker exec conch conch status`
+                                       # and `kamal accessory exec --reuse conch ...` (spec §10)
+                                       # both assume this name.
+    image: your-registry/conch:latest # build from Dockerfile and push under your own tag
+    host: host-a                      # pin, don't use `hosts:` — see the header comment
+    network: host
+
+    volumes:
+      # conch drives Docker directly: starting/stopping the service and
+      # connector containers, running one-off hook containers, and reading
+      # container state at startup reconcile (spec §5). Read-write — a
+      # read-only socket can't create or start containers.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # `disk.path` in the config below resolves INSIDE this container (spec
+      # §11's namespace honesty again) — without this bind, the scratch
+      # image has no /var/lib/docker at all, the free-space check errors
+      # every check forever, host health reads unhealthy permanently, and
+      # nothing on this host can ever promote. Read-only: conch only stats
+      # it, never writes.
+      - /var/lib/docker:/var/lib/docker:ro
+
+    files:
+      # Local path is relative to your Kamal project root, not this repo.
+      # The comment block above shows the minimum shape this file needs.
+      - config/conch.yml:/etc/conch/conch.yml:ro
+
+    env:
+      secret:
+        # Matches `arbiter.secret_env: CONCH_AUTH_SECRET` in the mounted
+        # config. Value comes from .kamal/secrets — see deploy/README.md
+        # for the add-next / roll-hosts / retire-old rotation procedure.
+        - CONCH_AUTH_SECRET
+
+    # No `labels:` here — spec §11 labels CONNECTOR containers, not conch
+    # itself (see the comment on cloudflared-web's `labels:`, below).
+
+  cloudflared-web:
+    service: cloudflared-web          # must equal `connector.container` in the mounted
+                                       # config, or conch is managing a container that
+                                       # doesn't exist.
+    image: cloudflare/cloudflared:latest
+    host: host-a
+    network: host
+
+    # The official image's ENTRYPOINT is already `cloudflared --no-autoupdate`
+    # (verified against cloudflare/cloudflared's Dockerfile) — `cmd:` here
+    # supplies only the rest of the invocation. `--metrics 127.0.0.1:2000`
+    # is what makes the ready check exist at all: cloudflared serves `/ready`
+    # on that port, returning 200 only once it has a live registered
+    # connection to the edge (spec §4's "connector container that is up but
+    # cannot register with the edge" signal). No `--token` flag is needed —
+    # cloudflared reads the tunnel token from the TUNNEL_TOKEN environment
+    # variable automatically when the command is `run`.
+    cmd: "tunnel --metrics 127.0.0.1:2000 run"
+
+    env:
+      secret:
+        - TUNNEL_TOKEN
+
+    labels:
+      # Load-bearing, and enforced: spec §11's reconcile sweep
+      # (internal/supervisor/sweep.go) lists this label every check and
+      # STOPS any container that is running, carries it, is not named anywhere
+      # in this host's config, and whose value names no configured service —
+      # which is precisely a connector left behind by a renamed or removed
+      # service, still serving with nothing supervising it.
+      #
+      # A wrong value here does NOT get this container stopped. This accessory
+      # is some service's `connector.container`, so the config names it, and a
+      # container the config names is never swept whatever its label says (the
+      # per-service reconcile owns it — the sweep would only be stopping what
+      # reconcile starts again). What a wrong value does is make the label
+      # INERT, and conch warns once per streak saying so. An empty value — a
+      # `${VAR}` that interpolated to nothing — is the same: shielded, warned,
+      # protecting nothing.
+      #
+      # Match the service's `name` in config.yml (its `lease_key` also
+      # counts). The value becomes load-bearing the day that service leaves
+      # the config: nothing names this container any more, and the sweep is
+      # then the thing that stops it.
+      #
+      # The label belongs on the CONNECTOR. The sweep never starts, creates or
+      # removes anything, so removing a stopped-out connector stays manual —
+      # see deploy/README.md's identity-fields section. `docker ps --filter
+      # label=conch.service=web` is useful to a human either way.
+      conch.service: web

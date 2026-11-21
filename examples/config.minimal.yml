@@ -1,0 +1,29 @@
+# A minimal conch configuration: one stateless service, one connector.
+# Copy this file, change `host:`, point `arbiter.url:` at your Worker, and
+# replace the container and health names with yours. Validate with:
+#
+#   conch validate --config examples/config.minimal.yml
+#
+# This is a single-host illustration. conch is designed for two hosts; run the
+# same service and lease key on both, changing only `host:`.
+host: host-a
+
+arbiter:
+  url: https://conch-lease.example.workers.dev
+  secret_env: CONCH_AUTH_SECRET
+
+timing:
+  ttl: 60
+  interval: 3
+  demote_after: 3
+  promote_after: 6
+
+services:
+  - name: web
+    container: web-web
+    connector:
+      container: cloudflared-web
+      stop_timeout: 35
+    health:
+      url: http://web-web:8080/up
+      expect: [200]

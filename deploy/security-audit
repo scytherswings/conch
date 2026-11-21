@@ -1,0 +1,82 @@
+#!/bin/sh
+# Fleet security audit — read-only posture + patch-drift check for conch hosts.
+#
+#   deploy/security-audit andrew@host-a andrew@host-b
+#   TARGET_RUBY=4.0.10 deploy/security-audit $(cat ~/.conch-hosts)
+#
+# Prints one block per host and exits non-zero if any check FAILs, so it can run
+# from cron, CI, or a scheduled agent task and page on drift. It answers the two
+# questions that actually rot: "is the host still hardened the way we left it?"
+# and "is anything we run now off the version we intend?". Keep real hostnames
+# out of the repo (CONTRIBUTING); pass them on the command line, like deploy/inventory.
+set -eu
+
+TARGET_RUBY="${TARGET_RUBY:-4.0.10}"
+
+if [ "$#" -eq 0 ]; then
+  echo "usage: deploy/security-audit ssh-target [ssh-target ...]" >&2
+  exit 2
+fi
+
+rc=0
+for host in "$@"; do
+  printf '==== %s ====\n' "$host"
+  if ssh -o ConnectTimeout=8 -o BatchMode=yes "$host" sh -s -- "$TARGET_RUBY" <<'REMOTE'
+target_ruby="$1"
+failed=0
+chk() { # severity, name, detail
+  printf '  %-6s %-24s %s\n' "$1" "$2" "$3"
+  [ "$1" = "FAIL" ] && failed=1
+  return 0
+}
+. /etc/os-release 2>/dev/null || :
+printf '  host: %s  (%s)\n' "$(hostname)" "${PRETTY_NAME:-unknown}"
+
+# OS patch state
+total=$(apt-get -s -o Debug::NoLocking=1 upgrade 2>/dev/null | grep -c '^Inst' || true)
+sec=$(apt-get -s -o Debug::NoLocking=1 upgrade 2>/dev/null | grep '^Inst' | grep -ci security || true)
+if [ "${sec:-0}" -gt 0 ]; then chk WARN "security updates" "$sec pending (of $total total)"; else chk PASS "security updates" "none (of $total total)"; fi
+if [ -f /var/run/reboot-required ]; then chk WARN "reboot required" yes; else chk PASS "reboot required" no; fi
+
+# Hardening services
+systemctl is-enabled unattended-upgrades >/dev/null 2>&1 && chk PASS "unattended-upgrades" enabled || chk FAIL "unattended-upgrades" "not enabled"
+systemctl is-active  auditd  >/dev/null 2>&1 && chk PASS "auditd"  active || chk FAIL "auditd"  inactive
+systemctl is-active  fail2ban >/dev/null 2>&1 && chk PASS "fail2ban" active || chk FAIL "fail2ban" inactive
+if sudo -n ufw status 2>/dev/null | grep -q '^Status: active'; then chk PASS "ufw" active; else chk FAIL "ufw" inactive; fi
+if sudo -n iptables -S DOCKER-USER 2>/dev/null | grep -q -- '-j DROP'; then chk PASS "docker ingress policy" "DOCKER-USER restricts published ports"; else chk FAIL "docker ingress policy" "no DOCKER-USER restriction"; fi
+
+# SSH posture
+if sudo -n sshd -T 2>/dev/null | grep -i '^passwordauthentication' | grep -qi no; then chk PASS "ssh password auth" disabled; else chk FAIL "ssh password auth" enabled; fi
+if sudo -n sshd -T 2>/dev/null | grep -i '^permitrootlogin' | grep -qi 'no$'; then chk PASS "ssh root login" disabled; else chk WARN "ssh root login" "$(sudo -n sshd -T 2>/dev/null | grep -i '^permitrootlogin' | awk '{print $2}')"; fi
+
+# Exposure (declared binds; DOCKER-USER is the actual enforcement, reported above)
+pub=$(docker ps --format '{{.Names}} {{.Ports}}' 2>/dev/null | grep -E '0\.0\.0\.0:' | sed 's/  */ /g' | tr '\n' ';')
+if [ -n "$pub" ]; then chk INFO "published (0.0.0.0)" "$pub"; else chk INFO "published (0.0.0.0)" none; fi
+ports=$(sudo -n ss -tlnH 2>/dev/null | awk '{print $4}' | grep -vE '^(127\.|\[::1\]|\[::ffff:127)' | sed -E 's/.*:([0-9]+)$/\1/' | sort -n -u | tr '\n' ',' | sed 's/,$//')
+chk INFO "listening ports" "${ports:-none}"
+
+# Version drift across running containers
+rough=""
+for c in $(docker ps --format '{{.Names}}' 2>/dev/null); do
+  v=$(docker exec "$c" /usr/local/bin/ruby -v 2>/dev/null | awk '/^ruby [0-9]/{print $2}') || continue
+  [ -n "$v" ] || continue
+  case "$v" in
+    "$target_ruby"*) : ;;
+    *) rough="$rough $c=$v" ;;
+  esac
+done
+if [ -z "$rough" ]; then chk PASS "ruby versions" "all on $target_ruby"; else chk FAIL "ruby versions" "off-target:$rough"; fi
+cf=$(docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null | grep -i cloudflared | awk '{print $2}' | sort -u | tr '\n' ' ')
+chk INFO "cloudflared images" "${cf:-none}"
+
+exit $failed
+REMOTE
+  then
+    :
+  else
+    printf '  (host reported failures, or was unreachable)\n'
+    rc=1
+  fi
+  echo
+done
+exit $rc

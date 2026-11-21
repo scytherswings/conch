@@ -1,0 +1,80 @@
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+env:
+  golang-version: "1.26"
+  node-version: "22"
+
+jobs:
+  conch:
+    name: conch (Go)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.golang-version }}
+          cache: true
+      - name: build
+        run: go build ./...
+      - name: vet
+        run: go vet ./...
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needs ::" 1>&2
+            printf '%s\n' "$unformatted" 1>&2
+            exit 1
+          fi
+      - name: validate example configs
+        run: |
+          go run ./cmd/conch validate --config deploy/config.example.host-a.yml
+          go run ./cmd/conch validate --config deploy/config.example.host-b.yml
+          go run ./cmd/conch validate --config examples/config.minimal.yml
+      - name: test
+        run: go test ./...
+
+  arbiter:
+    name: arbiter (Workers)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: arbiter
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.node-version }}
+          cache: npm
+          cache-dependency-path: arbiter/package-lock.json
+      - name: install
+        run: npm ci
+      - name: test
+        run: npm test
+
+  docker:
+    name: docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build image
+        run: docker build -t conch:ci .
+
+  secrets:
+    name: secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

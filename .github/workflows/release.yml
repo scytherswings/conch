@@ -1,0 +1,86 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  golang-version: "1.26"
+  node-version: "22"
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.golang-version }}
+          cache: true
+      - name: go test
+        run: go test ./...
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.node-version }}
+          cache: npm
+          cache-dependency-path: arbiter/package-lock.json
+      - name: arbiter test
+        run: |
+          cd arbiter
+          npm ci
+          npm test
+
+  release:
+    name: release
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.golang-version }}
+          cache: true
+      - name: build binaries
+        run: |
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os="${target%/*}"
+            arch="${target#*/}"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
+              go build -trimpath -ldflags="-s -w" \
+              -o "dist/conch-$os-$arch" ./cmd/conch
+          done
+          cd dist
+          sha256sum conch-* > SHA256SUMS
+      - name: create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+
+  image:
+    name: image
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: build image
+        run: |
+          docker build \
+            -t "ghcr.io/${{ github.repository }}:${{ github.ref_name }}" \
+            -t "ghcr.io/${{ github.repository }}:latest" .
+      - name: push image
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "ghcr.io/${{ github.repository }}:${{ github.ref_name }}"
+          docker push "ghcr.io/${{ github.repository }}:latest"

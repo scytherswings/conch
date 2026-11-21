@@ -1,0 +1,42 @@
+#!/bin/sh
+# conch pre-deploy validation (spec §6, §10): run `conch validate` against
+# the config this deploy is about to ship, using the same conch binary that
+# will run it — not a copy of the validation rules maintained separately in
+# some CI script that can drift from the real thing.
+#
+# A config that cannot boot fails the deploy here, not the host: `conch
+# validate` runs the exact composition checks conch itself refuses to start
+# without (timing composition, promote_after > demote_after, duplicate
+# lease_key/connector.container, loopback health URLs without
+# host_network: true, malformed auto_reclaim_after durations, ...) and
+# exits non-zero listing every fault at once, not one fault per re-run.
+#
+# Install: Kamal only recognizes hook files by exact name, with no
+# extension, under .kamal/hooks/ — copy or symlink this file to
+# .kamal/hooks/pre-deploy in your Kamal project. A non-zero exit here
+# aborts the deploy before anything reaches a host.
+#
+# Assumes: your conch config lives at ./config/conch.yml relative to the
+# Kamal project root (the same layout deploy/accessory-quick-start.yml and
+# conch-accessory.template.yml mount). If your project's config is named or
+# placed differently, edit CONFIG_DIR/CONFIG_FILE below to match, or make
+# this a symlink and keep the source under version control instead.
+set -eu
+
+CONFIG_DIR="config"
+CONFIG_FILE="conch.yml"
+
+# The conch image this deploy will actually run. Required, not defaulted —
+# a hardcoded placeholder here would validate against the wrong image (or
+# silently pull `latest` from wherever that resolves) without telling you.
+: "${CONCH_IMAGE:?set CONCH_IMAGE to the conch image:tag this deploy will run, e.g. your-registry/conch:latest}"
+
+if [ ! -f "$CONFIG_DIR/$CONFIG_FILE" ]; then
+  echo "pre-deploy-validate: $CONFIG_DIR/$CONFIG_FILE not found (run this from your Kamal project root)" >&2
+  exit 1
+fi
+
+exec docker run --rm \
+  -v "$PWD/$CONFIG_DIR:/etc/conch:ro" \
+  "$CONCH_IMAGE" \
+  validate --config "/etc/conch/$CONFIG_FILE"

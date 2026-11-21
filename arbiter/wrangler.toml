@@ -1,0 +1,15 @@
+name = "conch-lease"
+main = "src/index.js"
+compatibility_date = "2026-08-01"
+workers_dev = true
+
+[observability]
+enabled = true
+
+[[durable_objects.bindings]]
+name = "LEASE"
+class_name = "LeaseDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["LeaseDO"]

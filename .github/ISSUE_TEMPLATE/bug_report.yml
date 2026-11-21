@@ -1,0 +1,64 @@
+name: Bug report
+description: Something is broken in conch, the arbiter, or the deploy tooling.
+title: "[bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please do not include real hostnames, addresses,
+        credentials, or tunnel tokens. Redact them.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - conch supervisor
+        - arbiter (Cloudflare Worker)
+        - DynamoDB backend
+        - deploy tooling
+        - documentation
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The conch tag or commit, and the arbiter version if relevant.
+    validations:
+      required: true
+
+  - type: textarea
+    id: happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+      description: The smallest config and set of commands that shows the problem. Redact secrets and hostnames.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Redact hostnames, addresses, secrets, and tunnel tokens.
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I have read the known gaps in docs/known-gaps.md.
+          required: true
+        - label: I have removed real hostnames, addresses, and credentials from this report.
+          required: true

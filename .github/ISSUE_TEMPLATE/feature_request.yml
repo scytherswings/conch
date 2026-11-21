@@ -1,0 +1,42 @@
+name: Feature request
+description: Propose a change or a new capability.
+title: "[feature]: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        conch is deliberately small. Before proposing a change, read
+        CONTRIBUTING.md and docs/known-gaps.md. A feature that widens the
+        failure surface or adds a dependency needs a clear reason.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the problem, not only the proposed solution.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What do you propose?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Including doing nothing, or solving it outside conch.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I have read CONTRIBUTING.md.
+          required: true
+        - label: I have read docs/known-gaps.md.
+          required: true

@@ -1,0 +1,119 @@
+#!/bin/sh
+# Fleet inventory for conch — derive, don't maintain.
+#
+# "Which sites depend on conch?" is answered by the running fleet, not by a
+# document or an example yaml that goes stale the moment the fleet changes.
+# On every host there is one conch container, and `conch status` inside it
+# reports exactly what that host supervises: each service, its phase and
+# lease, the peer map, and the `last_stops` evidence. That is the inventory
+# at fleet level — a service supervised on any host is a service that
+# depends on conch; a site absent from every host's status is not
+# supervised, and may well be served active-active with no conch at all.
+#
+# Keep real hostnames out of this repo (CONTRIBUTING: example configs stay
+# generic). Hosts are passed on the command line:
+#
+#   deploy/inventory you@host-a you@host-b
+#   deploy/inventory host-a:conch-host-a        # explicit conch container
+#   deploy/inventory $(cat ~/.conch-hosts)      # wherever you keep the list
+#
+# The conch container auto-detects by name (exactly `conch`, or containing
+# `-conch-` / `conch-`), preferring a running one. An unreachable host is
+# reported as unreachable rather than omitted, so a box that is genuinely
+# down shows up in the inventory as down instead of dropping off a stale
+# list.
+set -eu
+
+if [ "$#" -eq 0 ]; then
+  echo "usage: deploy/inventory [ssh-target[:conch-container]] ..." >&2
+  exit 2
+fi
+
+format() {
+  # "$1" host, "$2" container; JSON status on stdin
+  python3 -c '
+import json
+import sys
+
+host, container = sys.argv[1], sys.argv[2]
+raw = sys.stdin.read()
+print("== " + host + " == (" + container + ")")
+if not raw.strip():
+    print("  (no status returned)")
+    sys.exit(0)
+try:
+    d = json.loads(raw)
+except ValueError:
+    print("  (status was not JSON)")
+    for line in raw.splitlines():
+        print("  " + line)
+    sys.exit(0)
+services = sorted(
+    (k, v) for k, v in d.items()
+    if isinstance(v, dict) and v.get("service")
+)
+if not services:
+    print("  (no supervised services)")
+for name, s in services:
+    stops = s.get("last_stops") or []
+    phase = str(s.get("phase", "?"))
+    lease = str(s.get("lease", "?"))
+    row = "  %-14s phase=%-9s lease=%-8s" % (name, phase, lease)
+    if stops:
+        last = stops[0]
+        row += "last_stop: %s [%s]" % (
+            last.get("reason", "?"),
+            last.get("container", "?"),
+        )
+    print(row)
+peers = d.get("peers") or {}
+if peers:
+    lines = [h + " last seen " + str(v) + "s ago" for h, v in sorted(peers.items())]
+    print("  peers: " + ", ".join(lines))
+elif "peers" in d:
+    print("  peers: none checked in recently")
+' "$1" "$2"
+}
+
+for target in "$@"; do
+  host="${target%%:*}"
+  wanted=""
+  case "$target" in
+    *:*) wanted="${target#*:}" ;;
+  esac
+  out=$(ssh -o ConnectTimeout=8 -o BatchMode=yes "$host" sh -s -- "$wanted" <<'REMOTE' 2>&1
+container="$1"
+if [ -z "$container" ]; then
+  candidates=$(docker ps -a --format '{{.Names}}|{{.Status}}' | grep -E '(^|-)conch(-|$)' || true)
+  if [ -z "$candidates" ]; then
+    echo "__NO_CONCH__"
+    exit 0
+  fi
+  container=$(printf '%s\n' "$candidates" | awk -F'|' '$2 ~ /^Up/ { print $1 }' | head -1)
+  if [ -z "$container" ]; then
+    container=$(printf '%s\n' "$candidates" | awk -F'|' '{ print $1 }' | head -1)
+  fi
+fi
+status=$(docker exec "$container" /conch status 2>/dev/null) || {
+  echo "__STATUS_FAILED__"
+  exit 0
+}
+printf '__CONTAINER__ %s\n%s\n' "$container" "$status"
+REMOTE
+) || {
+    echo "== $host == UNREACHABLE"
+    continue
+  }
+  if [ "$(printf '%s\n' "$out" | head -1)" = "__NO_CONCH__" ]; then
+    echo "== $host == no conch container found; is conch deployed on this host?"
+    continue
+  fi
+  container=$(printf '%s\n' "$out" | sed -n 's/^__CONTAINER__ //p' | head -1)
+  out=$(printf '%s\n' "$out" | grep -v '^__CONTAINER__ ' || true)
+  if [ "$(printf '%s\n' "$out" | head -1)" = "__STATUS_FAILED__" ]; then
+    echo "== $host == conch container $container not running (stopped? retired?)"
+    continue
+  fi
+  printf '%s\n' "$out" | format "$host" "${container:-no conch container auto-detected}"
+  echo
+done

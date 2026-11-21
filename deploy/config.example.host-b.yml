@@ -1,0 +1,116 @@
+# Example conch configuration for host-b (spec §11) — the standby mirror of
+# config.example.host-a.yml. Both hosts in a fleet supervise the same
+# services and lease keys; only `host:` differs.
+host: host-b
+arbiter:
+  url: https://conch-lease.example.workers.dev
+  secret_env: CONCH_AUTH_SECRET     # or secret_file: /run/secrets/conch
+  on_loss: freeze                   # freeze (default): arbiter down => hold shape, yell.
+                                     # stop: never serve past the lease, even if that
+                                     # stops the fleet when the arbiter dies.
+
+timing:                             # the four knobs; all else derived
+  ttl: 60
+  interval: 3
+  demote_after: 3
+  promote_after: 6
+
+disk:
+  path: /var/lib/docker
+  min_free_gb: 10
+
+webhooks:                           # all optional; POST JSON with full context
+  promote:  https://ops.example/hook/promote
+  demote:   https://ops.example/hook/demote
+  evacuate: https://ops.example/hook/evacuate
+  reclaim:  https://ops.example/hook/reclaim
+  alert:    https://ops.example/hook/alert
+
+services:
+  - name: web
+    lease_key: web                  # defaults to name
+    container: web-web              # the service container conch starts/stops
+    connector:
+      container: cloudflared-web    # deploy template labels this conch.service: web
+      stop_timeout: 35              # must exceed cloudflared's 30s grace
+    accessories:                    # sidecars that must run exactly where the
+      - web-litestream              # service serves (a continuous replicator):
+                                     # started on promotion before the connector,
+                                     # stopped wherever the service does not
+                                     # serve. Exact names, one owner per
+                                     # container, never a "*" pattern.
+    warm_accessories:                # runs on EVERY host, whatever the lease says — a
+      - web-postgres                 # RESTORE TARGET (this service's own database), never
+                                     # stopped by conch anywhere. Safe only because it is a
+                                     # restore target, not a writer: the standby's copy is
+                                     # stale, fenced-off local state that promotion overwrites
+                                     # wholesale (a pg_restore, an rclone sync) before anything
+                                     # serves out of it. web-litestream above is the opposite
+                                     # case — a single-writer SHIPPER — and must stay in
+                                     # accessories:, lease-following, or two writers on two
+                                     # hosts corrupt its replica's generation history. (Shown
+                                     # together here to illustrate the field's shape; a real
+                                     # service normally has one storage engine, not both —
+                                     # `web`'s own state below is actually the bind-mounted
+                                     # SQLite file litestream restores, not this Postgres.)
+    health:
+      url: http://web-web:8080/up   # docker-network DNS name, not loopback —
+                                     # this URL resolves inside the conch container
+      expect: [200]
+    hooks:
+      promote:
+        - name: restore
+          image: litestream/litestream
+          argv: ["restore", "-if-replica-exists", "/data/db.sqlite"]
+          binds: ["web-data:/data"]
+          env_file: /secrets/web-restore.env   # path as seen inside the conch container
+          timeout: 300
+        - name: verify
+          image: alpine/sqlite
+          argv: ["sqlite3", "/data/db.sqlite", "SELECT count(*) FROM users;"]
+          binds: ["web-data:/data"]
+          timeout: 30
+        # Re-registers the shared reverse proxy (kamal-proxy or similar) with the
+        # freshly restored app container. {container} substitutes THIS check's
+        # resolved container name — the exact literal only, near-miss spellings
+        # ({Container}, ${container}) are validation faults — into whichever
+        # argument your registration tool takes it as. The point here is the
+        # substitution, not this specific image: most proxy control planes are
+        # reached by execing into the ALREADY-RUNNING proxy container over its
+        # own socket, not from a fresh sibling container like this one, so
+        # `your-registry/register-proxy` below stands for whatever wrapper
+        # image or script does that exec for your proxy — bind its socket and
+        # put it on its network the same way. A static name works here since
+        # `container:` above is exact; the substitution earns its keep once
+        # `container:` is a trailing-"*" prefix pattern for a Kamal-versioned
+        # app, per deploy/README.md's "Kamal-deployed app containers" section,
+        # which this hook is the promote-time half of.
+        - name: register
+          image: your-registry/register-proxy
+          argv: ["--service", "web", "--target", "{container}:8080"]
+          timeout: 10
+      evacuate:
+        - name: final-sync
+          image: litestream/litestream
+          argv: ["replicate", "-once"]
+          binds: ["web-data:/data"]
+          timeout: 120
+    evacuation:
+      auto_reclaim_after: 30m       # optional; the evacuation bar self-expires so a
+                                     # forgotten evacuation heals itself. Default: never —
+                                     # and use `conch evacuate --hold` when tearing the
+                                     # host apart, so auto-reclaim cannot promote onto a
+                                     # host mid-surgery.
+
+  - name: blog                      # stateless: no hooks, nothing to restore
+    container: blog-web
+    connector: { container: cloudflared-blog }
+    health:
+      url: http://shared-proxy:80/up   # through the shared reverse proxy (kamal-proxy or
+                                        # similar) fronting several apps on one port, not
+                                        # straight at blog-web — so the probe takes the same
+                                        # routing decision a real visitor's request does
+      host: blog.example.com           # becomes the probe's Host header (req.Host, not a
+                                        # header map entry), which is what the proxy actually
+                                        # routes on; unset, this check would hit shared-proxy
+                                        # but land on whatever vhost is default there, not blog

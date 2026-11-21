@@ -1,0 +1,119 @@
+# conch: multi-service, per-host Kamal accessory template (spec §13)
+#
+# The shape for a fleet running more than one service (here: "web" and
+# "blog", matching deploy/config.example.host-a.yml and
+# config.example.host-b.yml). Two conch entries, one per host, each pinned
+# with `host:` (singular) rather than `hosts:` (plural) — the two hosts need
+# genuinely different mounted files, so one shared entry can't express them.
+# The connector accessories, by contrast, are identical on both hosts (same
+# image, same command, same secret), so each uses `hosts:` once instead of
+# being duplicated per host. No hostname magic anywhere: every host and
+# service name below is written out, not templated or inferred.
+#
+# This template uses docker-network DNS names, not host networking — the
+# other option spec §11 allows. config.example.host-a.yml's health URLs
+# (`http://web-web:8080/up`) resolve because Kamal puts every accessory and
+# every deployed service on the same docker network by default, and Docker's
+# embedded DNS resolves a container's name to its address on that network.
+# Nothing here needs `network: host`, and no `ready_url` is configured in
+# the example configs — see accessory-quick-start.yml if you want the
+# connector-readiness check too; it requires host networking on both the
+# conch and the cloudflared accessories to reach cloudflared's loopback
+# metrics port. If you add it here for MORE THAN ONE service on the same
+# host, give each connector's `--metrics` flag (and matching `ready_url`) a
+# DISTINCT port — `network: host` puts every container sharing it in the
+# same namespace, so "cloudflared-web" and "cloudflared-blog" both trying
+# to bind 127.0.0.1:2000 on one host collide; 2000 for web, 2001 for blog,
+# and so on.
+
+accessories:
+  conch-host-a:
+    # `service: conch` is deliberately the same literal name as
+    # conch-host-b's below — each is a different accessory KEY (Kamal's
+    # unit of "which host, which files, which container"), pinned to a
+    # different host, but the resulting container is named `conch` on
+    # EVERY host. That's what makes `docker exec conch conch status` (or
+    # `kamal accessory exec --reuse <this key> "conch status"`) work the
+    # same way regardless of which host you're standing on. If your Kamal
+    # version ever objects to two accessory entries sharing one `service:`
+    # name, give each a distinct name instead (`conch-a`, `conch-b`) and
+    # update deploy/README.md's `docker exec conch ...` examples to match.
+    service: conch
+    image: your-registry/conch:latest
+    host: host-a
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # `disk.path: /var/lib/docker` in config.example.host-a.yml resolves
+      # INSIDE this container — without this bind there is no
+      # /var/lib/docker in here at all, the free-space check fails forever,
+      # and this host can never promote. Read-only: conch only stats it.
+      - /var/lib/docker:/var/lib/docker:ro
+    files:
+      # Local path is relative to your Kamal project root, not this repo —
+      # copy config.example.host-a.yml in under a `deploy/` subdirectory
+      # there (or adjust this path to wherever you actually put it).
+      - deploy/config.example.host-a.yml:/etc/conch/conch.yml:ro
+    env:
+      secret:
+        - CONCH_AUTH_SECRET
+
+  conch-host-b:
+    service: conch
+    image: your-registry/conch:latest
+    host: host-b
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/docker:/var/lib/docker:ro
+    files:
+      - deploy/config.example.host-b.yml:/etc/conch/conch.yml:ro
+    env:
+      secret:
+        # Same secret NAME as host-a's entry, same value — both hosts
+        # authenticate to the same arbiter with the same shared secret.
+        # (Aliasing a container env var to a differently-named
+        # `.kamal/secrets` entry, e.g. `CONCH_AUTH_SECRET:replace-me`,
+        # is Kamal syntax for when the two need to differ; conch's don't.)
+        - CONCH_AUTH_SECRET
+
+  # One connector accessory per service, each covering both hosts — the
+  # container that must exist under a given name (`connector.container` in
+  # the config above) is identical everywhere it runs.
+  cloudflared-web:
+    service: cloudflared-web          # must equal services[].connector.container
+                                       # for "web" in both example configs
+    image: cloudflare/cloudflared:latest
+    hosts: [host-a, host-b]
+    cmd: "tunnel run"                 # no --metrics: the example configs set no
+                                       # connector.ready_url, so nothing consumes it
+    env:
+      secret:
+        # Aliased: the container always sees TUNNEL_TOKEN, but its value
+        # comes from this service's own entry in .kamal/secrets — "web"
+        # and "blog" are different Cloudflare Tunnels with different
+        # tokens, and must never share one.
+        - TUNNEL_TOKEN:TUNNEL_TOKEN_WEB
+    labels:
+      # Load-bearing — see accessory-quick-start.yml's comment on the same
+      # label. The value must name a service in config.yml (its `name`, or its
+      # `lease_key`). A wrong or empty value does not get this container
+      # stopped — the config names it, so the sweep leaves it alone and warns
+      # that the label is inert. It is what stops this container once the
+      # service it belongs to leaves the config, which is the whole point of
+      # setting it.
+      conch.service: web
+    # No `restart:` key, and no `options: { restart: ... }` override: Kamal's
+    # unconfigurable default (`--restart unless-stopped`) is what spec §4
+    # requires, and `always` would resurrect a connector conch stopped on
+    # purpose. See accessory-quick-start.yml for the full reasoning.
+
+  cloudflared-blog:
+    service: cloudflared-blog         # must equal services[].connector.container
+                                       # for "blog" in both example configs
+    image: cloudflare/cloudflared:latest
+    hosts: [host-a, host-b]
+    cmd: "tunnel run"
+    env:
+      secret:
+        - TUNNEL_TOKEN:TUNNEL_TOKEN_BLOG
+    labels:
+      conch.service: blog

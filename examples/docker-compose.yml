@@ -1,0 +1,47 @@
+# A minimal single-host illustration. conch is designed for two hosts: run the
+# same stack on each host, with the same service and lease key, and a different
+# `host:` in each conch.yml. See ../docs/quickstart.md for the full walkthrough.
+#
+# Create conch.yml first:
+#   cp config.minimal.yml conch.yml
+#   # edit host:, arbiter.url:, and the container/health names
+#
+# Then:
+#   CONCH_AUTH_SECRET=... TUNNEL_TOKEN=... docker compose up -d
+#
+# The conch container needs the Docker socket because it starts and stops the
+# connector. It is not a privileged container; the socket is the privilege.
+services:
+  web:
+    image: nginx:alpine
+    container_name: web-web
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/"]
+      interval: 5s
+      timeout: 2s
+      retries: 3
+
+  cloudflared-web:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared-web
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?set TUNNEL_TOKEN}
+    depends_on:
+      - web
+
+  conch:
+    image: ${CONCH_IMAGE:-ghcr.io/scytherswings/conch:latest}
+    container_name: conch
+    restart: unless-stopped
+    command: ["run", "--config", "/etc/conch/conch.yml"]
+    environment:
+      CONCH_AUTH_SECRET: ${CONCH_AUTH_SECRET:?set CONCH_AUTH_SECRET}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./conch.yml:/etc/conch/conch.yml:ro
+    depends_on:
+      - web
+      - cloudflared-web

@@ -1,0 +1,41 @@
+# --- local secrets -----------------------------------------------------------
+.dev.vars
+.env
+*.env
+secrets.env
+
+# --- private docs ---------------------------------------------------------------
+# Public docs live in docs/ and are tracked. Private design records, plans,
+# specs, runbooks, burn-in notes and decisions live in docs/private/ and are
+# never committed. Keep real hostnames and credential locations out of the
+# public tree entirely.
+/docs/private/
+
+# --- build and tool state ----------------------------------------------------
+.wrangler/
+node_modules/
+.venv/
+venv/
+__pycache__/
+*.log
+coverage.out
+coverage/
+*.test
+dist/
+bin/
+
+# the built conch binary; built from source, never committed
+/conch
+
+# --- editor / OS ---------------------------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+
+# --- local tool state ---------------------------------------------------------
+.claude/
+.ruby-lsp/
+
+# --- agent / worktree state ---------------------------------------------------
+.worktrees/
+.superpowers/
