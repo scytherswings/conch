@@ -97,13 +97,24 @@ func (c *Client) do(method, path string, body io.Reader, timeout time.Duration) 
 	return resp, cancel, nil
 }
 
+// containerPath builds an Engine API path for a container name, escaping the
+// name so a configured value containing "/", "?", "#" or a space can never
+// reshape the path or inject a query string (e.g. onto Stop's "?t=").
+// config/validate.go refuses such names too (dockerNameFault), but this is the
+// layer that actually builds the URL: hook container names are derived, not
+// configured, and a path builder must not depend on every caller having
+// validated first.
+func containerPath(name, suffix string) string {
+	return "/containers/" + url.PathEscape(name) + suffix
+}
+
 // Inspect reports whether name exists and, if so, whether it is running. A
 // 404 is not an error — it is the normal, expected answer for "no such
 // container" — and maps to the zero ContainerState (Exists:false). Any other
 // non-200 is a real failure the caller needs to see, since it means the
 // daemon couldn't answer the question at all rather than answering "no."
 func (c *Client) Inspect(name string) (ContainerState, error) {
-	resp, cancel, err := c.do(http.MethodGet, "/containers/"+name+"/json", nil, c.timeout)
+	resp, cancel, err := c.do(http.MethodGet, containerPath(name, "/json"), nil, c.timeout)
 	if err != nil {
 		return ContainerState{}, err
 	}
@@ -144,7 +155,7 @@ func (c *Client) Inspect(name string) (ContainerState, error) {
 // event in the log, and the 304 is the daemon's own answer to which it was,
 // already on the wire and previously thrown away.
 func (c *Client) Start(name string) (started bool, err error) {
-	resp, cancel, err := c.do(http.MethodPost, "/containers/"+name+"/start", nil, c.timeout)
+	resp, cancel, err := c.do(http.MethodPost, containerPath(name, "/start"), nil, c.timeout)
 	if err != nil {
 		return false, err
 	}
@@ -172,7 +183,7 @@ func (c *Client) Start(name string) (started bool, err error) {
 // reconcile reasoning as Start's 304: the reconcile loop asks for a state,
 // not for permission to no-op, so "already there" is success.
 func (c *Client) Stop(name string, timeoutSeconds int) error {
-	path := fmt.Sprintf("/containers/%s/stop?t=%d", name, timeoutSeconds)
+	path := containerPath(name, fmt.Sprintf("/stop?t=%d", timeoutSeconds))
 	callTimeout := time.Duration(timeoutSeconds+5) * time.Second
 	resp, cancel, err := c.do(http.MethodPost, path, nil, callTimeout)
 	if err != nil {
@@ -192,7 +203,7 @@ func (c *Client) Stop(name string, timeoutSeconds int) error {
 // Kill sends SIGKILL to name immediately, no grace period — the supervisor's
 // escalation path when Stop's deadline has already passed.
 func (c *Client) Kill(name string) error {
-	resp, cancel, err := c.do(http.MethodPost, "/containers/"+name+"/kill", nil, c.timeout)
+	resp, cancel, err := c.do(http.MethodPost, containerPath(name, "/kill"), nil, c.timeout)
 	if err != nil {
 		return err
 	}
@@ -350,7 +361,7 @@ func readEnvFile(path string) ([]string, error) {
 // daemon went away."
 func (c *Client) Wait(name string, timeoutSeconds float64) (int, error) {
 	timeout := time.Duration(timeoutSeconds * float64(time.Second))
-	resp, cancel, err := c.do(http.MethodPost, "/containers/"+name+"/wait", nil, timeout)
+	resp, cancel, err := c.do(http.MethodPost, containerPath(name, "/wait"), nil, timeout)
 	if err != nil {
 		return 0, err
 	}
@@ -376,7 +387,7 @@ func (c *Client) Wait(name string, timeoutSeconds float64) (int, error) {
 // to put in a notification, not another error path to handle on top of the
 // hook failure it's already reporting.
 func (c *Client) Logs(name string, tailLines int) string {
-	path := fmt.Sprintf("/containers/%s/logs?stdout=1&stderr=1&tail=%d", name, tailLines)
+	path := containerPath(name, fmt.Sprintf("/logs?stdout=1&stderr=1&tail=%d", tailLines))
 	resp, cancel, err := c.do(http.MethodGet, path, nil, c.timeout)
 	if err != nil {
 		return ""
@@ -430,7 +441,7 @@ func demux(r io.Reader) string {
 // how conch's own explicit remove call is allowed to behave once conch has
 // decided to remove one).
 func (c *Client) Remove(name string) error {
-	resp, cancel, err := c.do(http.MethodDelete, "/containers/"+name+"?force=1", nil, c.timeout)
+	resp, cancel, err := c.do(http.MethodDelete, containerPath(name, "?force=1"), nil, c.timeout)
 	if err != nil {
 		return err
 	}

@@ -126,6 +126,29 @@ func TestStopSendsTheConfiguredTimeout(t *testing.T) {
 	}
 }
 
+// TestNamesAreEscapedInTheRequestPath: a container name reaches the Engine API
+// path through containerPath, which escapes it. config/validate.go refuses
+// illegal names too, but that is the config layer; this is the layer that
+// builds the URL, and a name carrying "?" must not become a query string.
+func TestNamesAreEscapedInTheRequestPath(t *testing.T) {
+	var gotURI, gotQuery string
+	socket := fakeDaemon(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotURI = r.RequestURI
+		gotQuery = r.URL.RawQuery
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, `{"State":{"Running":false}}`)
+	}))
+	if _, err := dockerapi.New(socket, 1).Inspect("web?x=1"); err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	if gotQuery != "" {
+		t.Fatalf("a name must not inject a query string: RawQuery=%q", gotQuery)
+	}
+	if !strings.Contains(gotURI, "%3F") || strings.Contains(gotURI, "?") {
+		t.Fatalf("the ? in the name must be escaped, not treated as a query delimiter: %q", gotURI)
+	}
+}
+
 // Stop treats 304 as success for the same reason Start does: the reconcile
 // loop asks the daemon to reach a state, not for permission to act, so a
 // container that is already stopped is already correct — not a failure the
