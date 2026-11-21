@@ -29,6 +29,13 @@ lease is the cleanup; a malformed entry poisons only itself; `release` is refuse
 requester is the current holder; and an instance-id flip-flop within one TTL refuses **both** hosts
 with `duplicate_host` rather than letting two supervisors sharing a `host:` value both read "yours".
 
+Storage is bounded, so no authenticated caller can grow the one object every lease depends on
+without limit: at most `MAX_LEASES` service records may exist (a `renew` that would create a brand
+new key past the ceiling is refused `at_capacity` — the client fails closed on it, holding
+nothing), a host reports at most `MAX_HOST_IMAGES` images, a `release` of a never-claimed key mints
+no record, and hosts silent past an hour are forgotten. The ceiling is far above any real fleet;
+it only refuses pathological keys.
+
 ## Deploy
 
 ```sh

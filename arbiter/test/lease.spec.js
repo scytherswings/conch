@@ -1,5 +1,6 @@
 import { SELF, env, runInDurableObject, reset } from "cloudflare:test";
 import { describe, it, expect, vi, afterEach } from "vitest";
+import { MAX_LEASES, MAX_HOST_IMAGES } from "../src/lease.js";
 
 async function send(body) {
   const res = await SELF.fetch("https://arbiter.test/batch", {
@@ -16,6 +17,15 @@ const req = (host, instance, services, ttl = 60) =>
 async function leaseKeys() {
   const stub = env.LEASE.get(env.LEASE.idFromName("conch"));
   return runInDurableObject(stub, (instance) => Object.keys(instance.leases));
+}
+
+/** Pre-fill the live instance's lease table through the DO's own blank-record
+ *  factory, so a cap test does not have to make MAX_LEASES real round-trips. */
+async function seedLeases(n) {
+  const stub = env.LEASE.get(env.LEASE.idFromName("conch"));
+  await runInDurableObject(stub, (instance) => {
+    for (let i = 0; i < n; i++) instance.lease(`seed-${i}`);
+  });
 }
 
 // Any test that fakes the clock must restore it here, not at the end of its own
@@ -142,5 +152,44 @@ describe("presence: peers and fingerprints", () => {
 
     expect(body.peers["host-b"]).toBeUndefined();
     expect(body.fingerprints["host-b"]).toBeUndefined();
+  });
+});
+
+describe("storage bounds (F2)", () => {
+  it("a release of a never-claimed key does not persist a lease record", async () => {
+    const { body } = await send(req("host-a", "a1", { ghost: { op: "release" } }));
+    expect(body.services.ghost).toMatchObject({ state: "error", error: "not_holder" });
+    expect(await leaseKeys()).not.toContain("ghost");
+  });
+
+  it("caps the images a host reports at MAX_HOST_IMAGES", async () => {
+    const images = {};
+    for (let i = 0; i < MAX_HOST_IMAGES + 5; i++) images[`svc${i}`] = `img-${i}`;
+    await send({ ...req("host-a", "a1", {}), images });
+
+    const stub = env.LEASE.get(env.LEASE.idFromName("conch"));
+    const stored = await runInDurableObject(stub,
+      (instance) => Object.keys(instance.hosts["host-a"].images));
+    expect(stored).toHaveLength(MAX_HOST_IMAGES);
+  });
+
+  it("refuses a renew that would create a key past the lease ceiling, and creates nothing", async () => {
+    await seedLeases(MAX_LEASES);
+    const { body } = await send(req("host-a", "a1", { fresh: { op: "renew" } }));
+    expect(body.services.fresh).toMatchObject({ state: "error", error: "at_capacity" });
+    const keys = await leaseKeys();
+    expect(keys).not.toContain("fresh");
+    expect(keys).toHaveLength(MAX_LEASES);
+  });
+
+  it("still renews an existing key when the table is at the ceiling", async () => {
+    // The cap bounds creation, not a live lease: at the ceiling a host must keep
+    // renewing what it already holds. Seed one below the ceiling so the claim
+    // itself is the record that fills it, then renew it again.
+    await seedLeases(MAX_LEASES - 1);
+    const claim = await send(req("host-a", "a1", { web: { op: "renew" } }));
+    expect(claim.body.services.web.state).toBe("yours");
+    const again = await send(req("host-a", "a1", { web: { op: "renew" } }));
+    expect(again.body.services.web.state).toBe("yours");
   });
 });

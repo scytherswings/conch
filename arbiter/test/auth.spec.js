@@ -96,6 +96,10 @@ describe("worker surface", () => {
     });
     const res = await worker.fetch(req, {});
     expect(res.status).toBe(500);
-    expect((await res.json()).error).toBe("server_misconfigured");
+    const body = await res.json();
+    expect(body.error).toBe("server_misconfigured");
+    // No oracle: an unauthenticated caller learns only that it is misconfigured,
+    // never which secret is unset (the log says that).
+    expect(body.detail).toBeUndefined();
   });
 });

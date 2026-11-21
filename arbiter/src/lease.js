@@ -7,6 +7,15 @@ const STORAGE_KEY = "state";
 const TTL_MIN = 10, TTL_MAX = 300, TTL_DEFAULT = 60;
 const PRESENCE_TTL_MS = 3_600_000; // forget hosts silent for an hour
 
+// Hard ceilings on what one batch may persist (F2). The whole fleet lives in
+// this one object, so no authenticated caller — bug or brute force — may grow
+// it without bound. A renew may create a record only while the table has room;
+// a host reports at most as many images as the Worker lets a batch carry
+// services (MAX_SERVICES, index.js), which is also the most services a host can
+// legitimately have.
+export const MAX_LEASES = 1024;
+export const MAX_HOST_IMAGES = 64;
+
 const VALID_OPS = new Set(["renew", "read", "release"]);
 
 const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));
@@ -156,9 +165,11 @@ export class LeaseDO {
     // as "no opinion", never as a mismatch.
     const images = {};
     if (body.images && typeof body.images === "object") {
+      let n = 0;
       for (const [key, img] of Object.entries(body.images)) {
+        if (n >= MAX_HOST_IMAGES) break; // F2: a host cannot report images without limit
         if (!key || key.length > 128) continue;
-        if (typeof img === "string" && img) images[key] = img.slice(0, 512);
+        if (typeof img === "string" && img) { images[key] = img.slice(0, 512); n++; }
       }
     }
     this.hosts[host] = { lastSeen: now, fingerprint: body.fingerprint ?? null, images };
@@ -189,12 +200,31 @@ export class LeaseDO {
         continue;
       }
 
-      // renew/release legitimately create the record on first touch.
+      // A release is a statement about a lease the sender claims to hold, so it
+      // needs no record of its own: a key nobody has ever claimed is refused
+      // (not_holder) without minting one. Creating the blank record here would
+      // let any caller grow the table for free (F2), and releaseOne's verdict
+      // is identical either way.
+      if (entry.op === "release") {
+        const l = this.leases[key];
+        if (l === undefined) { services[key] = { state: "error", error: "not_holder" }; continue; }
+        this.expireIfDue(now, l);
+        services[key] = this.releaseOne(now, key, req, entry);
+        continue;
+      }
+
+      // renew legitimately creates the record on first touch, but only while the
+      // table has room. Past the ceiling a brand-new key is refused rather than
+      // allowed to grow the one object every lease depends on without limit.
+      // The Go client fails closed on an unknown error state (client.go's
+      // toVerdict), so a host simply holds nothing for that key.
+      if (this.leases[key] === undefined && Object.keys(this.leases).length >= MAX_LEASES) {
+        services[key] = { state: "error", error: "at_capacity" };
+        continue;
+      }
       const l = this.lease(key);
       this.expireIfDue(now, l);
-      services[key] = entry.op === "renew"
-        ? this.renewOne(now, key, req, entry)
-        : this.releaseOne(now, key, req, entry);
+      services[key] = this.renewOne(now, key, req, entry);
     }
 
     const peers = {}, fingerprints = {}, hostImages = {};

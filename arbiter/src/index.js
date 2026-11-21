@@ -37,8 +37,11 @@ export default {
     if (url.pathname !== "/batch") return json({ error: "not_found" }, 404);
     if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
 
+    // No detail: the shape of a fixed error is not a place to say why the
+    // deployment is broken (the log does). A URL holder learns only that it
+    // is misconfigured, not which secret is unset.
     if (!env.CONCH_AUTH_SECRET)
-      return json({ error: "server_misconfigured", detail: "CONCH_AUTH_SECRET unset" }, 500);
+      return json({ error: "server_misconfigured" }, 500);
     if (!authorized(request, env)) return json({ error: "unauthorized" }, 401);
 
     let body;
